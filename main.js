@@ -212,8 +212,14 @@ function createTray() {
 // Lifecycle
 // ---------------------------------------------------------------------------
 app.whenReady().then(async () => {
-  if (!fs.existsSync(BACKEND_SCRIPT)) {
-    dialog.showErrorBox('启动失败', `未找到后端脚本: ${BACKEND_SCRIPT}`);
+  // Validate the right backend target for the current mode (exe vs script).
+  const target = app.isPackaged ? backendCommand().cmd : BACKEND_SCRIPT;
+  if (!fs.existsSync(target)) {
+    dialog.showErrorBox(
+      '启动失败',
+      app.isPackaged
+        ? `未找到后端可执行文件: ${target}`
+        : `未找到后端脚本: ${target}`);
     app.quit();
     return;
   }
