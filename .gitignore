@@ -1,0 +1,13 @@
+# node / electron
+node_modules/
+dist/
+
+# python / pyinstaller
+__pycache__/
+*.pyc
+dist-backend/
+build-backend/
+*.spec.bak
+
+# misc
+_snap*.png

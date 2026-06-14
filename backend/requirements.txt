@@ -1,0 +1,15 @@
+# Runtime dependencies for the MIoT Desktop backend (server.py + vendored miot).
+# Note: fastmcp/mcp are intentionally omitted — only miot/mcp.py needs them and
+# the desktop backend never imports it.
+aiohttp>=3.12
+aiofiles>=24.1
+aiocache>=0.12
+pydantic>=2.4
+cryptography>=42
+pyyaml>=6
+zeroconf>=0.147
+psutil>=7.0
+av>=12
+pillow>=10.3
+# build tool
+pyinstaller>=6.10

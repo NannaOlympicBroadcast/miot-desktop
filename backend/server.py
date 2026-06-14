@@ -1,0 +1,543 @@
+# -*- coding: utf-8 -*-
+"""
+MIoT Desktop backend sidecar.
+
+A small aiohttp server that wraps the `miot_kit` library and exposes a local
+REST + WebSocket API consumed by the Electron renderer.
+
+It reuses the OAuth2 credentials that were already cached on this machine by
+the `login_miot.py` helper (default: ~/.miot_cache), so no login flow is
+needed inside the desktop app.
+
+Bound to 127.0.0.1 on an ephemeral port; the chosen port is printed to stdout
+as `MIOT_BACKEND_PORT=<port>` so the Electron main process can pick it up.
+"""
+import asyncio
+import json
+import logging
+import os
+import platform
+import sys
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+# ---------------------------------------------------------------------------
+# Locate and mount miot_kit
+#
+# - When frozen by PyInstaller, the `miot` package is bundled into the exe, so
+#   no external path is needed.
+# - In dev, we look for a vendored copy at <repo>/vendor/miot_kit (overridable
+#   via MIOT_KIT_PATH).
+# ---------------------------------------------------------------------------
+_FROZEN = getattr(sys, "frozen", False)
+_DEFAULT_KIT = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "vendor", "miot_kit"))
+MIOT_KIT_PATH = os.environ.get("MIOT_KIT_PATH", _DEFAULT_KIT)
+CACHE_PATH = os.environ.get("MIOT_CACHE_PATH", os.path.join(os.path.expanduser("~"), ".miot_cache"))
+CLOUD_SERVER = os.environ.get("MIOT_CLOUD_SERVER", "cn")
+LANG = os.environ.get("MIOT_LANG", "zh-Hans")
+
+if not _FROZEN and os.path.isdir(MIOT_KIT_PATH):
+    sys.path.insert(0, MIOT_KIT_PATH)
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+logging.basicConfig(level=logging.WARNING)
+_LOGGER = logging.getLogger("miot_desktop")
+
+# ---------------------------------------------------------------------------
+# Camera native library detection + Windows monkey patch
+#
+# The bundled miot_kit ships the camera P2P native lib only for linux/darwin.
+# On Windows the lib is absent, so loading it would crash client init. We
+# detect whether the real lib exists; if not we patch the loader with a no-op
+# fake (same approach the upstream helper scripts use) so the rest of the
+# client still initialises. Live video decode is only possible when the real
+# lib is present.
+# ---------------------------------------------------------------------------
+
+def _native_lib_path() -> Optional[Path]:
+    system = platform.system().lower()
+    machine = platform.machine().lower()
+    # Derive the libs dir from the actually-imported miot package, so it works
+    # both in dev (vendored/external) and when frozen by PyInstaller.
+    try:
+        import miot as _miot_pkg
+        base = Path(_miot_pkg.__file__).parent / "libs"
+    except Exception:
+        base = Path(MIOT_KIT_PATH) / "miot" / "libs"
+    if system == "windows":
+        arch = "x86_64" if machine in ("x86_64", "amd64") else ("arm64" if machine in ("arm64", "aarch64") else None)
+        if not arch:
+            return None
+        return base / "windows" / arch / "miot_camera_lite.dll"
+    if system == "linux":
+        arch = "x86_64" if machine in ("x86_64", "amd64") else ("arm64" if machine in ("arm64", "aarch64") else None)
+        if not arch:
+            return None
+        return base / "linux" / arch / "libmiot_camera_lite.so"
+    if system == "darwin":
+        arch = "x86_64" if machine == "x86_64" else ("arm64" if machine in ("arm64", "aarch64") else None)
+        if not arch:
+            return None
+        return base / "darwin" / arch / "libmiot_camera_lite.dylib"
+    return None
+
+
+_lib_path = _native_lib_path()
+CAMERA_NATIVE_AVAILABLE = bool(_lib_path and _lib_path.exists())
+
+if not CAMERA_NATIVE_AVAILABLE:
+    # Patch the dynamic-lib loader so MIoTCamera can be constructed without the
+    # real native library (all C calls become no-ops returning 0).
+    import miot.camera as _mc
+
+    class _FakeLib:
+        def __getattr__(self, name):
+            if name == "miot_camera_version":
+                return lambda *a, **k: b"0.0.0-fake"
+            return lambda *a, **k: 0
+
+    _mc._load_dynamic_lib = lambda: _FakeLib()  # type: ignore
+
+from aiohttp import web, WSMsgType  # noqa: E402
+
+from miot.client import MIoTClient  # noqa: E402
+from miot.cloud import MIoTOAuth2Client  # noqa: E402
+from miot.storage import MIoTStorage  # noqa: E402
+from miot.types import (  # noqa: E402
+    MIoTGetPropertyParam,
+    MIoTSetPropertyParam,
+    MIoTActionParam,
+)
+
+
+# ---------------------------------------------------------------------------
+# Spec serialisation: turn a parsed MIoTSpecDevice into renderer-friendly JSON
+# ---------------------------------------------------------------------------
+
+def _serialize_property(siid: int, prop) -> Dict[str, Any]:
+    value_range = None
+    if prop.value_range:
+        value_range = {
+            "min": prop.value_range.min_,
+            "max": prop.value_range.max_,
+            "step": prop.value_range.step,
+        }
+    value_list = None
+    if prop.value_list:
+        value_list = [
+            {"value": item.value, "description": item.description or item.name}
+            for item in prop.value_list
+        ]
+    return {
+        "siid": siid,
+        "piid": prop.iid,
+        "iid": f"prop.{siid}.{prop.iid}",
+        "name": prop.description_trans or prop.description,
+        "format": prop.format,
+        "access": prop.access,
+        "readable": "read" in prop.access,
+        "writable": "write" in prop.access,
+        "notify": "notify" in prop.access,
+        "unit": prop.unit,
+        "value_range": value_range,
+        "value_list": value_list,
+    }
+
+
+def _serialize_action(siid: int, action) -> Dict[str, Any]:
+    return {
+        "siid": siid,
+        "aiid": action.iid,
+        "iid": f"action.{siid}.{action.iid}",
+        "name": action.description_trans or action.description,
+        "in": [
+            {"piid": p.iid, "name": p.description_trans or p.description, "format": p.format}
+            for p in action.in_
+        ],
+    }
+
+
+def _serialize_spec(spec_device) -> Dict[str, Any]:
+    services = []
+    for svc in spec_device.services:
+        services.append({
+            "siid": svc.iid,
+            "name": svc.description_trans or svc.description,
+            "type": svc.type_,
+            "properties": [_serialize_property(svc.iid, p) for p in svc.properties],
+            "actions": [_serialize_action(svc.iid, a) for a in svc.actions],
+        })
+    return {
+        "urn": spec_device.urn,
+        "name": spec_device.description_trans or spec_device.description,
+        "services": services,
+    }
+
+
+# ---------------------------------------------------------------------------
+# App state
+# ---------------------------------------------------------------------------
+class Backend:
+    def __init__(self) -> None:
+        self.client: Optional[MIoTClient] = None
+        self.ready = False
+        self.error: Optional[str] = None
+
+    async def init(self) -> None:
+        storage = MIoTStorage(CACHE_PATH)
+        uuid = await storage.load_async(domain="cloud", name="uuid", type_=str)
+        oauth_info = await storage.load_async(domain="cloud", name="oauth_info", type_=dict)
+        if not oauth_info or not uuid:
+            raise RuntimeError(
+                f"未在缓存 {CACHE_PATH} 中找到登录凭证。请先运行 login_miot.py 完成米家 OAuth 授权。")
+        self.client = MIoTClient(
+            uuid=uuid,
+            redirect_uri="http://127.0.0.1",
+            cache_path=CACHE_PATH,
+            oauth_info=oauth_info,
+            cloud_server=CLOUD_SERVER,
+            lang=LANG,
+        )
+        await self.client.init_async()
+        self.ready = True
+
+    async def deinit(self) -> None:
+        if self.client:
+            try:
+                await self.client.deinit_async()
+            except Exception as err:  # pylint: disable=broad-except
+                _LOGGER.warning("deinit error: %s", err)
+            self.client = None
+        self.ready = False
+
+    async def reinit(self) -> None:
+        """Re-create the client (e.g. after a fresh login)."""
+        await self.deinit()
+        self.error = None
+        await self.init()
+
+
+BE = Backend()
+
+# OAuth login session state (used between /api/auth/start and /api/auth/complete).
+_AUTH: Dict[str, Any] = {"oauth": None, "uuid": None}
+
+
+def _parse_code_state(body: Dict[str, Any]) -> tuple:
+    """Accept either an explicit code+state or a full redirect URL."""
+    code = body.get("code")
+    state = body.get("state")
+    url = body.get("url")
+    if url and not code:
+        from urllib.parse import urlparse, parse_qs
+        q = parse_qs(urlparse(url).query)
+        code = (q.get("code") or [None])[0]
+        state = (q.get("state") or [None])[0]
+    return code, state
+
+
+def _json(data: Any, status: int = 200) -> web.Response:
+    return web.json_response(data, status=status, dumps=lambda o: json.dumps(o, ensure_ascii=False, default=str))
+
+
+def _err(message: str, status: int = 500) -> web.Response:
+    return _json({"error": message}, status=status)
+
+
+# ---------------------------------------------------------------------------
+# REST handlers
+# ---------------------------------------------------------------------------
+async def h_health(request: web.Request) -> web.Response:
+    return _json({
+        "ready": BE.ready,
+        "error": BE.error,
+        "camera_native_available": CAMERA_NATIVE_AVAILABLE,
+        "cloud_server": CLOUD_SERVER,
+        "cache_path": CACHE_PATH,
+        "platform": platform.system(),
+    })
+
+
+async def h_auth_status(request: web.Request) -> web.Response:
+    return _json({"logged_in": BE.ready, "error": BE.error})
+
+
+async def h_auth_start(request: web.Request) -> web.Response:
+    """Begin an OAuth2 login: create a client + return the authorize URL."""
+    try:
+        import uuid as _uuid
+        local_uuid = _uuid.uuid4().hex
+        oauth = MIoTOAuth2Client(
+            redirect_uri="http://127.0.0.1", cloud_server=CLOUD_SERVER, uuid=local_uuid)
+        url = oauth.gen_auth_url()
+        _AUTH["oauth"] = oauth
+        _AUTH["uuid"] = local_uuid
+        return _json({"url": url, "state": oauth.state})
+    except Exception as err:  # pylint: disable=broad-except
+        return _err(str(err))
+
+
+async def h_auth_complete(request: web.Request) -> web.Response:
+    """Finish login: exchange code -> token, persist to cache, re-init client."""
+    try:
+        body = await request.json()
+        code, state = _parse_code_state(body)
+        if not code or not state:
+            return _err("缺少 code 或 state，请粘贴完整的重定向 URL。", 400)
+        oauth = _AUTH.get("oauth")
+        local_uuid = _AUTH.get("uuid")
+        if not oauth or not local_uuid:
+            return _err("登录会话已过期，请重新获取登录链接。", 400)
+        if not await oauth.check_state_async(redirect_state=state):
+            return _err("state 校验失败，请重新获取登录链接后再试。", 400)
+        oauth_info = await oauth.get_access_token_async(code=code)
+        storage = MIoTStorage(CACHE_PATH)
+        await storage.save_async(domain="cloud", name="oauth_info", data=oauth_info.model_dump())
+        await storage.save_async(domain="cloud", name="uuid", data=local_uuid)
+        try:
+            await oauth.deinit_async()
+        except Exception:  # pylint: disable=broad-except
+            pass
+        _AUTH["oauth"] = None
+        _AUTH["uuid"] = None
+        await BE.reinit()
+        if not BE.ready:
+            return _err(BE.error or "登录后初始化失败", 500)
+        return _json({"ok": True})
+    except Exception as err:  # pylint: disable=broad-except
+        return _err(str(err))
+
+
+async def h_user(request: web.Request) -> web.Response:
+    try:
+        info = await BE.client.get_user_info_async()
+        return _json(info.model_dump())
+    except Exception as err:  # pylint: disable=broad-except
+        return _err(str(err))
+
+
+async def h_homes(request: web.Request) -> web.Response:
+    try:
+        homes = await BE.client.get_homes_async()
+        return _json({hid: h.model_dump() for hid, h in homes.items()})
+    except Exception as err:  # pylint: disable=broad-except
+        return _err(str(err))
+
+
+async def h_devices(request: web.Request) -> web.Response:
+    try:
+        devices = await BE.client.get_devices_async()
+        out = []
+        for did, dev in devices.items():
+            d = dev.model_dump()
+            d["did"] = did
+            d["device_class"] = dev.model.split(".")[1] if "." in dev.model else dev.model
+            out.append(d)
+        out.sort(key=lambda x: (not x.get("online", False), x.get("home_name", ""), x.get("name", "")))
+        return _json(out)
+    except Exception as err:  # pylint: disable=broad-except
+        return _err(str(err))
+
+
+async def h_cameras(request: web.Request) -> web.Response:
+    try:
+        cameras = await BE.client.get_cameras_async()
+        out = []
+        for did, cam in cameras.items():
+            c = cam.model_dump()
+            c["did"] = did
+            c["camera_status"] = int(cam.camera_status)
+            out.append(c)
+        return _json(out)
+    except Exception as err:  # pylint: disable=broad-except
+        return _err(str(err))
+
+
+async def h_spec(request: web.Request) -> web.Response:
+    did = request.query.get("did")
+    urn = request.query.get("urn")
+    try:
+        if not urn:
+            if not did:
+                return _err("missing did or urn", 400)
+            devices = await BE.client.get_devices_async()
+            if did not in devices:
+                return _err(f"device not found: {did}", 404)
+            urn = devices[did].urn
+        spec_device = await BE.client.spec_parser.parse_async(urn=urn)
+        if not spec_device:
+            return _err(f"failed to parse spec for urn: {urn}", 502)
+        return _json(_serialize_spec(spec_device))
+    except Exception as err:  # pylint: disable=broad-except
+        return _err(str(err))
+
+
+async def h_prop_get(request: web.Request) -> web.Response:
+    try:
+        body = await request.json()
+        param = MIoTGetPropertyParam(did=body["did"], siid=int(body["siid"]), piid=int(body["piid"]))
+        value = await BE.client.http_client.get_prop_async(param, immediately=True)
+        return _json({"value": value})
+    except Exception as err:  # pylint: disable=broad-except
+        return _err(str(err))
+
+
+async def h_props_get(request: web.Request) -> web.Response:
+    """Batch property read: body = {did, props: [[siid, piid], ...]}."""
+    try:
+        body = await request.json()
+        did = body["did"]
+        params = [MIoTGetPropertyParam(did=did, siid=int(s), piid=int(p)) for s, p in body["props"]]
+        results = await BE.client.http_client.get_props_async(params)
+        return _json({"results": results})
+    except Exception as err:  # pylint: disable=broad-except
+        return _err(str(err))
+
+
+async def h_prop_set(request: web.Request) -> web.Response:
+    try:
+        body = await request.json()
+        param = MIoTSetPropertyParam(
+            did=body["did"], siid=int(body["siid"]), piid=int(body["piid"]), value=body["value"])
+        result = await BE.client.http_client.set_prop_async(param)
+        return _json({"result": result})
+    except Exception as err:  # pylint: disable=broad-except
+        return _err(str(err))
+
+
+async def h_action(request: web.Request) -> web.Response:
+    try:
+        body = await request.json()
+        in_list = body.get("in", []) or []
+        param = MIoTActionParam(
+            did=body["did"], siid=int(body["siid"]), aiid=int(body["aiid"]), in_=in_list)
+        result = await BE.client.http_client.action_async(param)
+        return _json({"result": result})
+    except Exception as err:  # pylint: disable=broad-except
+        return _err(str(err))
+
+
+# ---------------------------------------------------------------------------
+# Camera live stream (WebSocket, JPEG frames)
+# ---------------------------------------------------------------------------
+async def ws_camera(request: web.Request) -> web.WebSocketResponse:
+    ws = web.WebSocketResponse()
+    await ws.prepare(request)
+    did = request.query.get("did", "")
+    pin = request.query.get("pin") or None
+
+    if not CAMERA_NATIVE_AVAILABLE:
+        await ws.send_json({
+            "type": "error",
+            "message": "当前平台缺少摄像头 P2P 原生库 (miot_camera_lite)，无法解码实时画面。设备控制功能仍可正常使用。",
+        })
+        await ws.close()
+        return ws
+
+    cameras = await BE.client.get_cameras_async()
+    cam_info = cameras.get(did)
+    if not cam_info:
+        await ws.send_json({"type": "error", "message": f"camera not found: {did}"})
+        await ws.close()
+        return ws
+
+    loop = asyncio.get_event_loop()
+    instance = None
+
+    async def on_jpg(_did: str, data: bytes, ts: int, channel: int) -> None:
+        if not ws.closed:
+            try:
+                await ws.send_bytes(bytes(data))
+            except Exception:  # pylint: disable=broad-except
+                pass
+
+    async def on_status(_did: str, status) -> None:
+        if not ws.closed:
+            try:
+                await ws.send_json({"type": "status", "status": int(status)})
+            except Exception:  # pylint: disable=broad-except
+                pass
+
+    try:
+        instance = await BE.client.create_camera_instance_async(cam_info)
+        await instance.register_decode_jpg_async(callback=on_jpg, channel=0)
+        await instance.register_status_changed_async(callback=on_status)
+        await instance.start_async(pin_code=pin, enable_reconnect=True)
+        await ws.send_json({"type": "started"})
+        async for msg in ws:
+            if msg.type in (WSMsgType.CLOSE, WSMsgType.ERROR):
+                break
+    except Exception as err:  # pylint: disable=broad-except
+        if not ws.closed:
+            await ws.send_json({"type": "error", "message": str(err)})
+    finally:
+        try:
+            if instance:
+                await BE.client.camera_client.destroy_camera_async(did)
+        except Exception:  # pylint: disable=broad-except
+            pass
+        if not ws.closed:
+            await ws.close()
+    return ws
+
+
+async def on_startup(app: web.Application) -> None:
+    try:
+        await BE.init()
+    except Exception as err:  # pylint: disable=broad-except
+        BE.error = str(err)
+        _LOGGER.error("backend init failed: %s", err)
+
+
+async def on_cleanup(app: web.Application) -> None:
+    await BE.deinit()
+
+
+def build_app() -> web.Application:
+    app = web.Application()
+    app.router.add_get("/api/health", h_health)
+    app.router.add_get("/api/auth/status", h_auth_status)
+    app.router.add_post("/api/auth/start", h_auth_start)
+    app.router.add_post("/api/auth/complete", h_auth_complete)
+    app.router.add_get("/api/user", h_user)
+    app.router.add_get("/api/homes", h_homes)
+    app.router.add_get("/api/devices", h_devices)
+    app.router.add_get("/api/cameras", h_cameras)
+    app.router.add_get("/api/spec", h_spec)
+    app.router.add_post("/api/prop/get", h_prop_get)
+    app.router.add_post("/api/props/get", h_props_get)
+    app.router.add_post("/api/prop/set", h_prop_set)
+    app.router.add_post("/api/action", h_action)
+    app.router.add_get("/ws/camera", ws_camera)
+    app.on_startup.append(on_startup)
+    app.on_cleanup.append(on_cleanup)
+    return app
+
+
+def main() -> None:
+    if platform.system() == "Windows":
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    app = build_app()
+    runner = web.AppRunner(app)
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(runner.setup())
+    site = web.TCPSite(runner, "127.0.0.1", 0)
+    loop.run_until_complete(site.start())
+    # Report the actual port to the parent process.
+    port = None
+    for server in runner.sites:
+        sock = list(server._server.sockets)[0]  # type: ignore[attr-defined]
+        port = sock.getsockname()[1]
+        break
+    print(f"MIOT_BACKEND_PORT={port}", flush=True)
+    try:
+        loop.run_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        loop.run_until_complete(runner.cleanup())
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'self'; connect-src http://127.0.0.1:* ws://127.0.0.1:*; img-src 'self' https: data: blob:; style-src 'self' 'unsafe-inline';" />
+  <title>米家桌面端</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo">🏠</span>
+      <span class="brand-text">米家桌面端</span>
+    </div>
+    <nav class="tabs">
+      <button class="tab active" data-tab="devices">设备控制</button>
+      <button class="tab" data-tab="cameras">摄像头</button>
+    </nav>
+    <div class="topbar-right">
+      <span id="status-dot" class="status-dot offline" title="后端状态"></span>
+      <span id="status-text" class="status-text">连接中…</span>
+      <button id="refresh-btn" class="icon-btn" title="刷新">⟳</button>
+      <button id="settings-btn" class="icon-btn" title="设置">⚙</button>
+    </div>
+  </header>
+
+  <!-- ===================== SETTINGS MODAL ===================== -->
+  <div id="settings-mask" class="modal-mask hidden">
+    <div class="modal">
+      <div class="modal-head">
+        <span>设置</span>
+        <button id="settings-close" class="icon-btn">✕</button>
+      </div>
+      <div class="modal-body">
+        <div class="setting-row">
+          <div>
+            <div class="setting-name">开机自动启动</div>
+            <div class="setting-desc">登录系统后自动在后台启动并驻留托盘</div>
+          </div>
+          <label class="switch"><input type="checkbox" id="auto-launch" /><span class="slider-sw"></span></label>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <main>
+    <!-- ===================== DEVICES ===================== -->
+    <section id="tab-devices" class="tab-panel active">
+      <aside class="sidebar">
+        <div class="sidebar-head">
+          <h2>设备</h2>
+          <input id="device-search" class="search" type="text" placeholder="搜索设备…" />
+        </div>
+        <ul id="device-list" class="device-list"></ul>
+      </aside>
+      <div class="content">
+        <div id="device-detail" class="detail">
+          <div class="placeholder">
+            <div class="placeholder-icon">📡</div>
+            <p>从左侧选择一个设备，加载它的 SPEC 功能定义并进行控制。</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ===================== CAMERAS ===================== -->
+    <section id="tab-cameras" class="tab-panel">
+      <div class="camera-wrap">
+        <div id="camera-banner" class="banner hidden"></div>
+        <div id="camera-grid" class="camera-grid"></div>
+      </div>
+    </section>
+  </main>
+
+  <div id="toast" class="toast hidden"></div>
+
+  <script src="app.js"></script>
+</body>
+</html>

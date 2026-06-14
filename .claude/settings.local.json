@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cd /d D:\\\\claw\\\\xiaomi_home_bundle\\\\miot_kit\\\\miot)",
+      "Bash(dir /s /b *.py)",
+      "Bash(findstr /v __pycache__)"
+    ]
+  }
+}
