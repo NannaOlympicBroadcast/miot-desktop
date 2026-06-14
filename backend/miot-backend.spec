@@ -32,7 +32,7 @@ for pkg in [
         print('collect_all skip', pkg, e)
 
 a = Analysis(
-    ['backend/server.py'],
+    [os.path.join(ROOT, 'backend', 'server.py')],
     pathex=[VENDOR, os.path.join(ROOT, 'backend')],
     binaries=binaries,
     datas=datas,
