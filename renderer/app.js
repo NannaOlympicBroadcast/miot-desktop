@@ -128,18 +128,14 @@ function showLogin(errMsg) {
     <div class="login-card">
       <h2>登录小米账号</h2>
       <p class="login-msg">${escapeHtml(errMsg || '需要登录后才能加载设备。')}</p>
-      <ol class="login-steps">
-        <li>点击「获取登录链接」，浏览器会打开小米授权页面。</li>
-        <li>完成登录后，浏览器会跳转到一个无法访问的 <code>127.0.0.1</code> 地址 —— 这是正常的。</li>
-        <li>复制浏览器地址栏中<strong>完整的跳转后 URL</strong>（含 <code>code=</code> 与 <code>state=</code>），粘贴到下方并「完成登录」。</li>
-      </ol>
+      <p class="login-msg">点击下方按钮，在应用内完成小米账号登录授权。</p>
       <div class="login-actions">
-        <button class="btn primary" id="login-start">获取登录链接</button>
+        <button class="btn primary" id="login-start">登录小米账号</button>
       </div>
       <div id="login-url-box" class="login-url-box hidden">
-        <div class="login-label">如未自动打开，请手动复制此链接：</div>
+        <div class="login-label">如登录窗口未弹出，可手动复制此链接到浏览器打开：</div>
         <textarea id="login-url" class="text-input login-url" rows="2" readonly></textarea>
-        <div class="login-label" style="margin-top:10px">粘贴跳转后的完整 URL：</div>
+        <div class="login-label" style="margin-top:10px">完成授权后，粘贴跳转后的完整 URL：</div>
         <textarea id="login-redirect" class="text-input login-url" rows="2" placeholder="http://127.0.0.1/?code=...&state=..."></textarea>
         <div class="login-actions">
           <button class="btn primary" id="login-complete">完成登录</button>
@@ -152,28 +148,39 @@ function showLogin(errMsg) {
 async function startLogin() {
   const btn = $('#login-start');
   btn.disabled = true;
-  btn.textContent = '获取中…';
+  btn.textContent = '登录中…';
   try {
     const r = await apiPost('/api/auth/start', {});
     $('#login-url').value = r.url;
-    $('#login-url-box').classList.remove('hidden');
-    try { await window.miot.openExternal(r.url); } catch (e) { /* user can copy manually */ }
     $('#login-complete').addEventListener('click', completeLogin, { once: false });
-    toast('已在浏览器打开授权页面', 'ok');
+
+    // Open the authorize page in an in-app window and capture the redirect
+    // ourselves, so the user doesn't have to copy/paste the URL.
+    const redirectUrl = await window.miot.oauthLogin(r.url);
+    if (redirectUrl) {
+      await finishLogin(redirectUrl);
+      return;
+    }
+    // User closed the login window before completing -> fall back to manual paste.
+    $('#login-url-box').classList.remove('hidden');
+    toast('登录窗口已关闭，可手动粘贴跳转后的 URL 完成登录', 'err');
   } catch (e) {
     toast('获取登录链接失败: ' + e.message, 'err');
   } finally {
     btn.disabled = false;
-    btn.textContent = '重新获取登录链接';
+    btn.textContent = '重新登录';
   }
 }
 
 async function completeLogin() {
   const url = ($('#login-redirect').value || '').trim();
   if (!url) { toast('请粘贴跳转后的完整 URL', 'err'); return; }
+  await finishLogin(url);
+}
+
+async function finishLogin(url) {
   const btn = $('#login-complete');
-  btn.disabled = true;
-  btn.textContent = '登录中…';
+  if (btn) { btn.disabled = true; btn.textContent = '登录中…'; }
   try {
     await apiPost('/api/auth/complete', { url });
     toast('登录成功', 'ok');
@@ -181,8 +188,8 @@ async function completeLogin() {
     await refreshAuthAndRender();
   } catch (e) {
     toast('登录失败: ' + e.message, 'err');
-    btn.disabled = false;
-    btn.textContent = '完成登录';
+    if (btn) { btn.disabled = false; btn.textContent = '完成登录'; }
+    $('#login-url-box').classList.remove('hidden');
   }
 }
 
