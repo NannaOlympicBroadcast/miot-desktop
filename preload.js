@@ -13,5 +13,6 @@ contextBridge.exposeInMainWorld('miot', {
   showMain: () => ipcRenderer.invoke('show-main'),
   hideWindow: () => ipcRenderer.invoke('hide-window'),
   broadcast: (channel) => ipcRenderer.invoke('broadcast', channel),
+  oauthLogin: (authUrl) => ipcRenderer.invoke('oauth-login', authUrl),
   on: (channel, cb) => ipcRenderer.on(channel, () => cb()),
 });

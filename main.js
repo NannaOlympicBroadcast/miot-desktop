@@ -121,6 +121,46 @@ ipcMain.handle('broadcast', (e, channel) => {
 });
 
 // ---------------------------------------------------------------------------
+// In-app OAuth login: open the Xiaomi authorize page in a child window and
+// capture the http://127.0.0.1 redirect URL ourselves, so the user never has
+// to copy/paste it from an external browser.
+// ---------------------------------------------------------------------------
+ipcMain.handle('oauth-login', (e, authUrl) => {
+  return new Promise((resolve) => {
+    const parent = BrowserWindow.fromWebContents(e.sender);
+    const loginWindow = new BrowserWindow({
+      width: 480,
+      height: 680,
+      parent: parent || undefined,
+      modal: !!parent,
+      title: '登录小米账号',
+      autoHideMenuBar: true,
+      webPreferences: { contextIsolation: true, nodeIntegration: false },
+    });
+    loginWindow.removeMenu();
+
+    let settled = false;
+    const finish = (redirectUrl) => {
+      if (settled) return;
+      settled = true;
+      resolve(redirectUrl);
+      if (!loginWindow.isDestroyed()) loginWindow.close();
+    };
+
+    const checkRedirect = (url) => {
+      if (/^https?:\/\/127\.0\.0\.1(\/|:|$|\?)/.test(url)) finish(url);
+    };
+
+    loginWindow.webContents.on('will-redirect', (ev, url) => checkRedirect(url));
+    loginWindow.webContents.on('will-navigate', (ev, url) => checkRedirect(url));
+    loginWindow.webContents.on('did-fail-load', (ev, code, desc, url) => checkRedirect(url));
+    loginWindow.on('closed', () => finish(null));
+
+    loginWindow.loadURL(authUrl);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Windows
 // ---------------------------------------------------------------------------
 function createMainWindow() {
