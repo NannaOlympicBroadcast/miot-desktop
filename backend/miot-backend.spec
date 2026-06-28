@@ -11,7 +11,10 @@ import os
 import sys
 from PyInstaller.utils.hooks import collect_all
 
-ROOT = os.path.abspath(os.getcwd())
+# PyInstaller chdirs to the spec file's directory before exec'ing it, so
+# os.getcwd() would point at backend/ here, not the repo root. Use the
+# SPECPATH it injects instead (the directory containing this spec file).
+ROOT = os.path.abspath(os.path.join(SPECPATH, '..'))
 VENDOR = os.path.join(ROOT, 'vendor', 'miot_kit')
 # Make the vendored `miot` importable during analysis (for collect_all + imports).
 sys.path.insert(0, VENDOR)
