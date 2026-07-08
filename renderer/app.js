@@ -128,15 +128,19 @@ function showLogin(errMsg) {
     <div class="login-card">
       <h2>登录小米账号</h2>
       <p class="login-msg">${escapeHtml(errMsg || '需要登录后才能加载设备。')}</p>
-      <p class="login-msg">点击下方按钮，在应用内完成小米账号登录授权。</p>
+      <p class="login-msg">点击下方按钮，应用内窗口会弹出小米授权页面，登录后自动完成授权。</p>
       <div class="login-actions">
         <button class="btn primary" id="login-start">登录小米账号</button>
       </div>
       <div id="login-url-box" class="login-url-box hidden">
-        <div class="login-label">如登录窗口未弹出，可手动复制此链接到浏览器打开：</div>
+        <div class="login-label">如授权窗口未弹出，请手动复制以下链接到浏览器完成登录：</div>
         <textarea id="login-url" class="text-input login-url" rows="2" readonly></textarea>
-        <div class="login-label" style="margin-top:10px">完成授权后，粘贴跳转后的完整 URL：</div>
-        <textarea id="login-redirect" class="text-input login-url" rows="2" placeholder="http://127.0.0.1/?code=...&state=..."></textarea>
+        <div class="login-label" style="margin-top:12px">
+          登录完成后，将浏览器地址栏中的<strong>完整跳转 URL</strong>（含 <code>code=</code>）
+          或仅复制其中的<strong>授权码（code= 后面的值）</strong>粘贴到下方：
+        </div>
+        <textarea id="login-redirect" class="text-input login-url" rows="2"
+          placeholder="http://127.0.0.1/?code=…&state=… 或仅粘贴授权码"></textarea>
         <div class="login-actions">
           <button class="btn primary" id="login-complete">完成登录</button>
         </div>
@@ -173,16 +177,18 @@ async function startLogin() {
 }
 
 async function completeLogin() {
-  const url = ($('#login-redirect').value || '').trim();
-  if (!url) { toast('请粘贴跳转后的完整 URL', 'err'); return; }
-  await finishLogin(url);
+  const raw = ($('#login-redirect').value || '').trim();
+  if (!raw) { toast('请粘贴跳转后的完整 URL 或授权码', 'err'); return; }
+  await finishLogin(raw);
 }
 
-async function finishLogin(url) {
+async function finishLogin(raw) {
   const btn = $('#login-complete');
   if (btn) { btn.disabled = true; btn.textContent = '登录中…'; }
+  // Accept either a full redirect URL (contains code=) or a bare auth code.
+  const body = raw.includes('code=') ? { url: raw } : { code: raw };
   try {
-    await apiPost('/api/auth/complete', { url });
+    await apiPost('/api/auth/complete', body);
     toast('登录成功', 'ok');
     try { window.miot.broadcast('logged-in'); } catch (e) {}
     await refreshAuthAndRender();
