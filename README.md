@@ -1,4 +1,4 @@
-# 米家桌面端 (MIoT Desktop)
+# 米家桌面端 (MIoT Desktop) 
 
 基于 **Electron + miot-kit** 的米家桌面客户端。提供图形界面用于：
 
