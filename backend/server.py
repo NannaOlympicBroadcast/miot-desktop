@@ -101,7 +101,6 @@ if not CAMERA_NATIVE_AVAILABLE:
 from aiohttp import web, WSMsgType  # noqa: E402
 
 from miot.client import MIoTClient  # noqa: E402
-from miot.cloud import MIoTOAuth2Client  # noqa: E402
 from miot.storage import MIoTStorage  # noqa: E402
 from miot.types import (  # noqa: E402
     MIoTGetPropertyParam,
@@ -219,20 +218,31 @@ class Backend:
 
 BE = Backend()
 
-# OAuth login session state (used between /api/auth/start and /api/auth/complete).
-_AUTH: Dict[str, Any] = {"oauth": None, "uuid": None}
+# OAuth login session: holds the temporary MIoTClient created by /api/auth/start
+# and the state token needed to complete the exchange.
+_AUTH: Dict[str, Any] = {"client": None, "uuid": None, "state": None}
 
 
-def _parse_code_state(body: Dict[str, Any]) -> tuple:
-    """Accept either an explicit code+state or a full redirect URL."""
+def _parse_code_state(body: Dict[str, Any], fallback_state: Optional[str] = None) -> tuple:
+    """Extract (code, state) from a request body.
+
+    Accepts any of:
+      - {"url": "http://127.0.0.1/?code=xxx&state=yyy"}  — full redirect URL
+      - {"code": "xxx", "state": "yyy"}                  — explicit fields
+      - {"code": "xxx"}                                   — bare code; state comes from the
+                                                            in-flight session (fallback_state)
+    """
+    from urllib.parse import urlparse, parse_qs
     code = body.get("code")
     state = body.get("state")
     url = body.get("url")
-    if url and not code:
-        from urllib.parse import urlparse, parse_qs
+    if url:
         q = parse_qs(urlparse(url).query)
-        code = (q.get("code") or [None])[0]
-        state = (q.get("state") or [None])[0]
+        code = code or (q.get("code") or [None])[0]
+        state = state or (q.get("state") or [None])[0]
+    # bare code pasted without state — fall back to the session-stored state
+    if code and not state and fallback_state:
+        state = fallback_state
     return code, state
 
 
@@ -263,43 +273,81 @@ async def h_auth_status(request: web.Request) -> web.Response:
 
 
 async def h_auth_start(request: web.Request) -> web.Response:
-    """Begin an OAuth2 login: create a client + return the authorize URL."""
+    """Begin an OAuth2 login flow using MIoTClient (matches login_miot.py approach).
+
+    Creates a temporary client, generates the Xiaomi authorize URL, and stashes
+    the client in _AUTH so /api/auth/complete can exchange the code for a token.
+    Returns {"url": "<authorize_url>", "state": "<oauth_state>"}.
+    """
     try:
         import uuid as _uuid
+        # Tear down any previous in-flight session.
+        prev = _AUTH.get("client")
+        if prev:
+            try:
+                await prev.deinit_async()
+            except Exception:  # pylint: disable=broad-except
+                pass
+
         local_uuid = _uuid.uuid4().hex
-        oauth = MIoTOAuth2Client(
-            redirect_uri="http://127.0.0.1", cloud_server=CLOUD_SERVER, uuid=local_uuid)
-        url = oauth.gen_auth_url()
-        _AUTH["oauth"] = oauth
+        tmp_client = MIoTClient(
+            uuid=local_uuid,
+            redirect_uri="http://127.0.0.1",
+            cache_path=CACHE_PATH,
+            cloud_server=CLOUD_SERVER,
+            lang=LANG,
+        )
+        await tmp_client.init_async()
+        url = await tmp_client.gen_oauth_url_async()
+        # Persist the state token so we can verify it (and fall back to it if
+        # the user pastes only the bare code without the full redirect URL).
+        oauth_state = tmp_client._oauth_client.state  # type: ignore[attr-defined]
+        _AUTH["client"] = tmp_client
         _AUTH["uuid"] = local_uuid
-        return _json({"url": url, "state": oauth.state})
+        _AUTH["state"] = oauth_state
+        return _json({"url": url, "state": oauth_state})
     except Exception as err:  # pylint: disable=broad-except
         return _err(str(err))
 
 
 async def h_auth_complete(request: web.Request) -> web.Response:
-    """Finish login: exchange code -> token, persist to cache, re-init client."""
+    """Finish login: exchange authorization code for token, persist, re-init.
+
+    Accepts any of:
+      - {"url": "http://127.0.0.1/?code=xxx&state=yyy"}  full redirect URL (auto-captured)
+      - {"code": "xxx", "state": "yyy"}                  explicit fields
+      - {"code": "xxx"}                                   bare code pasted by user
+    """
     try:
         body = await request.json()
-        code, state = _parse_code_state(body)
-        if not code or not state:
-            return _err("缺少 code 或 state，请粘贴完整的重定向 URL。", 400)
-        oauth = _AUTH.get("oauth")
-        local_uuid = _AUTH.get("uuid")
-        if not oauth or not local_uuid:
-            return _err("登录会话已过期，请重新获取登录链接。", 400)
-        if not await oauth.check_state_async(redirect_state=state):
-            return _err("state 校验失败，请重新获取登录链接后再试。", 400)
-        oauth_info = await oauth.get_access_token_async(code=code)
-        storage = MIoTStorage(CACHE_PATH)
-        await storage.save_async(domain="cloud", name="oauth_info", data=oauth_info.model_dump())
-        await storage.save_async(domain="cloud", name="uuid", data=local_uuid)
+        code, state = _parse_code_state(body, fallback_state=_AUTH.get("state"))
+        if not code:
+            return _err("缺少授权码 (code)，请粘贴完整的跳转 URL 或授权码。", 400)
+        if not state:
+            return _err("缺少 state 参数，请重新获取登录链接。", 400)
+
+        tmp_client: Optional[MIoTClient] = _AUTH.get("client")
+        local_uuid: Optional[str] = _AUTH.get("uuid")
+        if not tmp_client or not local_uuid:
+            return _err("登录会话已过期，请重新点击「登录」。", 400)
+
+        # Exchange code → token (state validation happens inside get_access_token_async).
+        oauth_info = await tmp_client.get_access_token_async(code=code, state=state)
+
+        # Persist credentials to ~/.miot_cache (same paths as login_miot.py).
+        await tmp_client.storage.save_async(
+            domain="cloud", name="oauth_info", data=oauth_info.model_dump())
+        await tmp_client.storage.save_async(
+            domain="cloud", name="uuid", data=local_uuid)
+
         try:
-            await oauth.deinit_async()
+            await tmp_client.deinit_async()
         except Exception:  # pylint: disable=broad-except
             pass
-        _AUTH["oauth"] = None
+        _AUTH["client"] = None
         _AUTH["uuid"] = None
+        _AUTH["state"] = None
+
         await BE.reinit()
         if not BE.ready:
             return _err(BE.error or "登录后初始化失败", 500)
