@@ -254,6 +254,33 @@ def _err(message: str, status: int = 500) -> web.Response:
     return _json({"error": message}, status=status)
 
 
+def _is_unauthorized(err: Exception) -> bool:
+    """Best-effort detection of an expired/invalid access token.
+
+    miot_kit surfaces this as a plain RuntimeError/ValueError whose message
+    contains the mihome API's own wording (e.g. "unauthorized(401)"), so we
+    match on that rather than a specific exception type.
+    """
+    msg = str(err).lower()
+    return "401" in msg or "unauthorized" in msg or "invalid access token" in msg or "token expired" in msg
+
+
+def _client_err(err: Exception) -> web.Response:
+    """Turn a MIoTClient call failure into a response.
+
+    If the failure looks like an expired/invalid credential, mark the backend
+    as not-ready (so /api/health reflects it) and flag the response with
+    auth_required so the renderer can jump straight to the login screen
+    instead of just printing the raw error text.
+    """
+    if _is_unauthorized(err):
+        message = "登录凭证已过期或失效，请重新登录小米账号。"
+        BE.ready = False
+        BE.error = message
+        return _json({"error": message, "auth_required": True}, status=401)
+    return _err(str(err))
+
+
 # ---------------------------------------------------------------------------
 # REST handlers
 # ---------------------------------------------------------------------------
@@ -361,7 +388,7 @@ async def h_user(request: web.Request) -> web.Response:
         info = await BE.client.get_user_info_async()
         return _json(info.model_dump())
     except Exception as err:  # pylint: disable=broad-except
-        return _err(str(err))
+        return _client_err(err)
 
 
 async def h_homes(request: web.Request) -> web.Response:
@@ -369,7 +396,7 @@ async def h_homes(request: web.Request) -> web.Response:
         homes = await BE.client.get_homes_async()
         return _json({hid: h.model_dump() for hid, h in homes.items()})
     except Exception as err:  # pylint: disable=broad-except
-        return _err(str(err))
+        return _client_err(err)
 
 
 async def h_devices(request: web.Request) -> web.Response:
@@ -384,7 +411,7 @@ async def h_devices(request: web.Request) -> web.Response:
         out.sort(key=lambda x: (not x.get("online", False), x.get("home_name", ""), x.get("name", "")))
         return _json(out)
     except Exception as err:  # pylint: disable=broad-except
-        return _err(str(err))
+        return _client_err(err)
 
 
 async def h_cameras(request: web.Request) -> web.Response:
@@ -398,7 +425,7 @@ async def h_cameras(request: web.Request) -> web.Response:
             out.append(c)
         return _json(out)
     except Exception as err:  # pylint: disable=broad-except
-        return _err(str(err))
+        return _client_err(err)
 
 
 async def h_spec(request: web.Request) -> web.Response:
@@ -417,7 +444,7 @@ async def h_spec(request: web.Request) -> web.Response:
             return _err(f"failed to parse spec for urn: {urn}", 502)
         return _json(_serialize_spec(spec_device))
     except Exception as err:  # pylint: disable=broad-except
-        return _err(str(err))
+        return _client_err(err)
 
 
 async def h_prop_get(request: web.Request) -> web.Response:
@@ -427,7 +454,7 @@ async def h_prop_get(request: web.Request) -> web.Response:
         value = await BE.client.http_client.get_prop_async(param, immediately=True)
         return _json({"value": value})
     except Exception as err:  # pylint: disable=broad-except
-        return _err(str(err))
+        return _client_err(err)
 
 
 async def h_props_get(request: web.Request) -> web.Response:
@@ -439,7 +466,7 @@ async def h_props_get(request: web.Request) -> web.Response:
         results = await BE.client.http_client.get_props_async(params)
         return _json({"results": results})
     except Exception as err:  # pylint: disable=broad-except
-        return _err(str(err))
+        return _client_err(err)
 
 
 async def h_prop_set(request: web.Request) -> web.Response:
@@ -450,7 +477,7 @@ async def h_prop_set(request: web.Request) -> web.Response:
         result = await BE.client.http_client.set_prop_async(param)
         return _json({"result": result})
     except Exception as err:  # pylint: disable=broad-except
-        return _err(str(err))
+        return _client_err(err)
 
 
 async def h_action(request: web.Request) -> web.Response:
@@ -462,7 +489,7 @@ async def h_action(request: web.Request) -> web.Response:
         result = await BE.client.http_client.action_async(param)
         return _json({"result": result})
     except Exception as err:  # pylint: disable=broad-except
-        return _err(str(err))
+        return _client_err(err)
 
 
 # ---------------------------------------------------------------------------

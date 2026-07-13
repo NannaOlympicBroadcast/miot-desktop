@@ -192,6 +192,8 @@ select:focus, .text-input:focus { border-color: var(--primary); }
   border-radius: var(--radius); box-shadow: var(--shadow); padding: 28px 30px; }
 .login-card h2 { margin: 0 0 6px; font-size: 20px; }
 .login-msg { color: var(--text-soft); font-size: 13px; margin: 0 0 16px; }
+.login-hint { background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; }
+.login-hint code { background: var(--panel); padding: 1px 5px; border-radius: 4px; font-size: 12px; }
 .login-steps { color: var(--text); font-size: 13px; line-height: 1.9; padding-left: 20px; margin: 0 0 18px; }
 .login-steps code { background: var(--bg); padding: 1px 5px; border-radius: 4px; font-size: 12px; }
 .login-actions { margin-top: 12px; }

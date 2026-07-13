@@ -11,11 +11,31 @@ let CURRENT_DID = null;
 const $ = (sel) => document.querySelector(sel);
 const $$ = (sel) => Array.from(document.querySelectorAll(sel));
 
+// Thrown when the backend reports the cached mihome credential is expired or
+// invalid (401), so callers can route straight to the login screen instead of
+// just printing the raw error text.
+class AuthRequiredError extends Error {
+  constructor(message) {
+    super(message);
+    this.authRequired = true;
+  }
+}
+
 async function api(path, opts) {
   const res = await fetch(BASE + path, opts);
   const data = await res.json().catch(() => ({ error: 'invalid json response' }));
-  if (data && data.error) throw new Error(data.error);
+  if (data && data.error) {
+    if (data.auth_required) throw new AuthRequiredError(data.error);
+    throw new Error(data.error);
+  }
   return data;
+}
+
+// Central handler for an expired/invalid credential detected mid-session:
+// jump to the login screen instead of leaving stale UI + an error toast.
+function handleAuthExpired(message) {
+  setStatus(false, '登录已过期');
+  showLogin(message);
 }
 function apiPost(path, body) {
   return api(path, {
@@ -129,6 +149,11 @@ function showLogin(errMsg) {
       <h2>登录小米账号</h2>
       <p class="login-msg">${escapeHtml(errMsg || '需要登录后才能加载设备。')}</p>
       <p class="login-msg">点击下方按钮，应用内窗口会弹出小米授权页面，登录后自动完成授权。</p>
+      <p class="login-msg login-hint">
+        提示：登录凭据保存在本地 <code>${escapeHtml(HEALTH.cache_path || '~/.miot_cache')}</code>，
+        与 <strong>ssr-agent</strong>、<strong>Claude 米家桌面扩展 (claude-mijia-desktop-extension)</strong> 共享同一份凭据，
+        任一端登录后其余端均可直接使用，无需重复登录。
+      </p>
       <div class="login-actions">
         <button class="btn primary" id="login-start">登录小米账号</button>
       </div>
@@ -208,6 +233,7 @@ async function loadDevices() {
     DEVICES = await api('/api/devices');
     renderDeviceList();
   } catch (e) {
+    if (e.authRequired) { handleAuthExpired(e.message); return; }
     $('#device-list').innerHTML = `<li class="loading" style="color:var(--red)">${escapeHtml(e.message)}</li>`;
   }
 }
@@ -264,6 +290,7 @@ async function selectDevice(did) {
   try {
     spec = await api('/api/spec?did=' + encodeURIComponent(did));
   } catch (e) {
+    if (e.authRequired) { handleAuthExpired(e.message); return; }
     detail.querySelector('.loading').outerHTML =
       `<div class="loading" style="color:var(--red)">加载 SPEC 失败: ${escapeHtml(e.message)}</div>`;
     return;
@@ -383,6 +410,7 @@ async function readProp(did, p) {
     const r = await apiPost('/api/prop/get', { did, siid: p.siid, piid: p.piid });
     applyPropValue(p, `p_${p.siid}_${p.piid}`, r.value);
   } catch (e) {
+    if (e.authRequired) { handleAuthExpired(e.message); return; }
     toast('读取失败: ' + e.message, 'err');
   }
 }
@@ -401,6 +429,7 @@ async function readAllProps(did, spec) {
       if (`${p.siid}.${p.piid}` in map) applyPropValue(p, `p_${p.siid}_${p.piid}`, map[`${p.siid}.${p.piid}`]);
     });
   } catch (e) {
+    if (e.authRequired) { handleAuthExpired(e.message); return; }
     toast('批量读取失败: ' + e.message, 'err');
   }
 }
@@ -411,6 +440,7 @@ async function setProp(did, p, value) {
     toast(`已设置「${p.name}」`, 'ok');
     setTimeout(() => readProp(did, p), 400);
   } catch (e) {
+    if (e.authRequired) { handleAuthExpired(e.message); return; }
     toast('设置失败: ' + e.message, 'err');
     readProp(did, p);
   }
@@ -449,6 +479,7 @@ async function runAction(did, a, key) {
     await apiPost('/api/action', { did, siid: a.siid, aiid: a.aiid, in: inList });
     toast(`已执行「${a.name}」`, 'ok');
   } catch (e) {
+    if (e.authRequired) { handleAuthExpired(e.message); return; }
     toast('执行失败: ' + e.message, 'err');
   }
 }
@@ -474,6 +505,7 @@ async function loadCameras() {
   try {
     cams = await api('/api/cameras');
   } catch (e) {
+    if (e.authRequired) { handleAuthExpired(e.message); return; }
     grid.innerHTML = `<div class="loading" style="color:var(--red)">${escapeHtml(e.message)}</div>`;
     return;
   }
