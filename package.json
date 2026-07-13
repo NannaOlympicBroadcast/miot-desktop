@@ -1,6 +1,6 @@
 {
   "name": "miot-desktop",
-  "version": "1.1.0",
+  "version": "2.0.1",
   "description": "米家桌面端 - 查看摄像头并通过 SPEC 控制设备 (基于 miot-kit + Electron)",
   "main": "main.js",
   "scripts": {
