@@ -17,5 +17,10 @@ pillow>=10.3
 miservice_fork>=2.9
 # Miloco Docker controller health checks (backend/miloco_controller.py).
 httpx>=0.27
+# SSR agent, bundled into the runtime as the "SSR 助手" tab's driver
+# (backend/ssr_agent_bridge.py). Installed from the repo so a packaged build
+# embeds it; in dev you can instead set SSR_AGENT_PATH to a source checkout.
+# This pulls in google-adk / google-genai / model2vec and other heavy deps.
+ssr-agent @ git+https://github.com/NannaOlympicBroadcast/ssr-agent.git
 # build tool
 pyinstaller>=6.10

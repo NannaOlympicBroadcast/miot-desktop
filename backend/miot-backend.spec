@@ -26,6 +26,12 @@ for pkg in [
     'aiohttp', 'aiocache', 'aiofiles',
     'zeroconf', 'cryptography', 'yaml', 'psutil',
     'miservice', 'httpx',
+    # SSR agent + its runtime deps, so the frozen backend embeds the "SSR 助手"
+    # driver. These are optional: a build without ssr-agent installed simply
+    # skips them (collect_all raises, we log and continue), and the SSR tab
+    # degrades gracefully at runtime.
+    'ssr', 'google.adk', 'google.genai', 'model2vec', 'numpy', 'tavily',
+    'websockets', 'dotenv', 'rich', 'pyfiglet', 'prompt_toolkit',
 ]:
     try:
         d, b, h = collect_all(pkg)
