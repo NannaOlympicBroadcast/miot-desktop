@@ -25,6 +25,9 @@ httpx>=0.27
 # (SSRAgent, load_settings, ModelsConfig, ssr.integrations.miloco), far fewer
 # packaging dependencies (google-adk / google-genai / model2vec / tavily /
 # httpx / websockets only — no CLI/TUI or IM-channel SDKs).
-ssr-agent-minimal @ git+https://github.com/NannaOlympicBroadcast/ssr-minimal.git@main
+# NOTE: ssr-minimal has no "main" branch — its repo default branch is
+# claude/affectionate-feynman-fhu9sh (verified via the GitHub API). Pointing
+# at "main" here would make this line unresolvable and break `pip install`.
+ssr-agent-minimal @ git+https://github.com/NannaOlympicBroadcast/ssr-minimal.git@claude/affectionate-feynman-fhu9sh
 # build tool
 pyinstaller>=6.10
