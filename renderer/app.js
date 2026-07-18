@@ -68,6 +68,7 @@ $$('.tab').forEach((tab) => {
     tab.classList.add('active');
     $('#tab-' + tab.dataset.tab).classList.add('active');
     if (tab.dataset.tab === 'cameras') loadCameras();
+    if (tab.dataset.tab === 'xiaomi') loadXiaomi();
   });
 });
 
@@ -76,8 +77,10 @@ $('#refresh-btn').addEventListener('click', () => {
   if (active === 'devices') {
     loadDevices();
     if (CURRENT_DID) selectDevice(CURRENT_DID);
-  } else {
+  } else if (active === 'cameras') {
     loadCameras();
+  } else if (active === 'xiaomi') {
+    loadXiaomi();
   }
 });
 
@@ -578,5 +581,291 @@ function stopCamera(did) {
 window.addEventListener('beforeunload', () => {
   Object.keys(camStreams).forEach(stopCamera);
 });
+
+// ===========================================================================
+// XiaoAI (小爱音箱) ASR/TTS bridge
+//
+// A *different* credential than the OAuth2 login above (see
+// backend/xiaomi_asr_bridge.py): obtained via an in-app browser login window
+// (main.js `xiaomi-passport-login`), the speaker is picked from the user's
+// already-known miot devices, and new spoken queries can be forwarded to a
+// webhook. The "如何使用 SDK" panel shows how to point the standalone
+// `xiaomi-speaker-sdk` package at the same token.
+// ===========================================================================
+let XIAOMI = { status: null, tokenInfo: null, candidates: [], bridge: null, selectedDid: '' };
+
+async function loadXiaomi() {
+  const wrap = $('#xiaomi-wrap');
+  wrap.innerHTML = '<div class="loading"><span class="spinner"></span> 加载中…</div>';
+  try {
+    const [status, tokenInfo, bridge] = await Promise.all([
+      api('/api/xiaomi/status'),
+      api('/api/xiaomi/token'),
+      api('/api/xiaomi/bridge/status'),
+    ]);
+    XIAOMI.status = status;
+    XIAOMI.tokenInfo = tokenInfo;
+    XIAOMI.bridge = bridge;
+    XIAOMI.selectedDid = '';
+    if (status.has_token) {
+      try { XIAOMI.candidates = await api('/api/xiaomi/speaker-candidates'); }
+      catch (e) { XIAOMI.candidates = []; XIAOMI.candidatesError = e.message; }
+    } else {
+      XIAOMI.candidates = [];
+    }
+  } catch (e) {
+    wrap.innerHTML = `<div class="loading" style="color:var(--red)">加载失败：${escapeHtml(e.message)}</div>`;
+    return;
+  }
+  renderXiaomi();
+}
+
+function renderXiaomi() {
+  const { status, tokenInfo, candidates, bridge } = XIAOMI;
+  const wrap = $('#xiaomi-wrap');
+  const device = status.device;
+
+  const tokenCard = `
+    <div class="xm-card">
+      <div class="xm-card-head">
+        <span>1. 获取 Token</span>
+        <span class="dev-online ${tokenInfo.has_token ? 'on' : 'off'}" title="${tokenInfo.has_token ? '已获取' : '未获取'}"></span>
+      </div>
+      <p class="login-msg">
+        小爱音箱的语音识别 (ASR) / 语音播报 (TTS) 使用的是小米账号 <strong>passport 登录凭据</strong>，
+        与上方「设备控制」使用的米家开放平台 OAuth2 登录是<strong>两套不同的凭据</strong>，需要单独获取一次。
+        点击下方按钮会弹出一个登录窗口，正常登录小米账号（可按提示完成短信/设备安全验证）即可，
+        无需手动复制任何链接。
+      </p>
+      <div class="login-actions">
+        <button class="btn primary" id="xm-extract-btn">提取 Token（登录小米账号）</button>
+      </div>
+      ${tokenInfo.has_token ? `
+        <div class="login-hint" style="margin-top:14px">
+          <div>Token 文件：<code>${escapeHtml(tokenInfo.token_path)}</code></div>
+          <div>userId：<code>${escapeHtml(tokenInfo.user_id)}</code></div>
+          <div>passToken：<code>${escapeHtml(tokenInfo.pass_token_masked)}</code>（出于安全考虑仅展示末位字符；
+            完整值请直接查看本地 Token 文件，不通过界面显示）</div>
+        </div>` : ''}
+    </div>`;
+
+  const candList = candidates.length ? candidates.map((d) => `
+      <label class="xm-radio-row">
+        <input type="radio" name="xm-speaker" value="${escapeHtml(d.did)}" data-name="${escapeHtml(d.name)}"
+          ${device && device.did === d.did ? 'checked' : ''} />
+        <span class="dev-online ${d.online ? 'on' : 'off'}"></span>
+        <span>${escapeHtml(d.name)}</span>
+        <span class="device-sub">${escapeHtml(d.home_name || '')} · ${escapeHtml(d.model || '')}</span>
+      </label>`).join('')
+    : `<div class="hint">${tokenInfo.has_token
+        ? (XIAOMI.candidatesError ? escapeHtml(XIAOMI.candidatesError) : '在你的米家设备中未发现小爱音箱类设备。')
+        : '请先完成上方 Token 提取。'}</div>`;
+
+  const speakerCard = `
+    <div class="xm-card">
+      <div class="xm-card-head">
+        <span>2. 选择音箱</span>
+        ${device ? `<span class="device-sub">已选择：${escapeHtml(device.name)}</span>` : ''}
+      </div>
+      <p class="login-msg">从你米家账号下已有的音箱设备中选择一个用于 ASR / TTS（会自动与小爱账号下的设备匹配）。</p>
+      <div class="xm-radio-list">${candList}</div>
+      <div class="login-actions">
+        <button class="btn primary" id="xm-select-btn" ${tokenInfo.has_token ? '' : 'disabled'}>确认选择</button>
+      </div>
+    </div>`;
+
+  const webhookCard = `
+    <div class="xm-card">
+      <div class="xm-card-head">
+        <span>3. Webhook 推送</span>
+        <span class="dev-online ${bridge.running ? 'on' : 'off'}" title="${bridge.running ? '运行中' : '未运行'}"></span>
+      </div>
+      <p class="login-msg">收到新的小爱语音识别结果时，实时 POST 一份 JSON 到下面的 Webhook 地址。</p>
+      <div class="xm-form-row">
+        <label>Webhook URL</label>
+        <input class="text-input" id="xm-webhook-url" style="max-width:360px"
+          placeholder="https://your-server.com/webhook" value="${escapeHtml(bridge.webhook_url || '')}" />
+      </div>
+      <div class="xm-form-row">
+        <label>唤醒词（可选）</label>
+        <input class="text-input" id="xm-wake-word" style="max-width:200px"
+          placeholder="留空=转发所有语音" value="${escapeHtml(bridge.wake_word || '')}" />
+      </div>
+      <div class="login-actions">
+        <button class="btn" id="xm-save-config-btn">保存配置</button>
+        <button class="btn ${bridge.running ? '' : 'primary'}" id="xm-toggle-bridge-btn">${bridge.running ? '停止推送' : '启动推送'}</button>
+      </div>
+      <div class="login-hint" style="margin-top:14px">
+        <div>状态：${bridge.running ? '<span style="color:var(--green)">运行中</span>' : '未运行'}</div>
+        <div>已推送次数：${bridge.forwarded_count || 0}</div>
+        <div>最近一次：${bridge.last_forwarded_at ? new Date(bridge.last_forwarded_at).toLocaleString() : '—'}</div>
+        ${bridge.error ? `<div style="color:var(--red)">最近错误：${escapeHtml(bridge.error)}</div>` : ''}
+      </div>
+      <div class="login-hint" style="margin-top:10px">
+        <div class="login-label" style="margin:0 0 6px">推送的 JSON 示例：</div>
+        <pre class="xm-code">{
+  "request_id": "1700000000000",
+  "question": "今天天气怎么样",
+  "raw_question": "今天天气怎么样",
+  "device_id": "...",
+  "device_name": "客厅音箱",
+  "timestamp": 1700000000000
+}</pre>
+      </div>
+    </div>`;
+
+  const speakCard = `
+    <div class="xm-card">
+      <div class="xm-card-head"><span>接管播报测试</span></div>
+      <p class="login-msg">用来验证「直接接管音箱播报」能力：会暂停当前播放并朗读下面的文字。</p>
+      <div class="xm-form-row">
+        <input class="text-input" id="xm-speak-text" style="max-width:360px" placeholder="要播报的文字" />
+        <button class="btn primary" id="xm-speak-btn" ${device ? '' : 'disabled'}>播报</button>
+      </div>
+    </div>`;
+
+  const guideCard = `
+    <div class="xm-card">
+      <div class="xm-card-head"><span>如何用 SDK 开发自己的小爱音箱机器人</span></div>
+      <p class="login-msg">
+        上面提取到的 Token 与独立的 <code>xiaomi-speaker-sdk</code>（ssr-agent 仓库中的
+        <code>xiaomi_speaker_sdk/</code> 包）使用同一套凭据格式，可以直接拿去开发自己的机器人：
+        监听新的语音识别事件，或者随时接管音箱进行语音播报。
+      </p>
+      <ol class="login-steps">
+        <li>安装 SDK：<code>pip install xiaomi-speaker-sdk</code>（或从 ssr-agent 仓库的
+          <code>xiaomi_speaker_sdk/</code> 目录 <code>pip install .</code>）。</li>
+        <li>Token 文件本身不经过界面展示（出于安全考虑），直接在本机把它复制过去即可——
+          从 <code>${escapeHtml(tokenInfo.token_path)}</code> 复制到
+          <code>~/.xiaomi_speaker_sdk/token.json</code>（两者是同一种 JSON 格式，
+          SDK 会直接识别其中的 passToken/userId）。也可以打开该文件，把
+          <code>passToken</code>/<code>userId</code> 两个字段的值粘到
+          <code>xiaomi_speaker_sdk.token_store.import_pass_token()</code> 里。</li>
+        <li>然后就可以监听 ASR / 接管播报了：</li>
+      </ol>
+      <pre class="xm-code">import asyncio
+from xiaomi_speaker_sdk import XiaomiSpeaker, XiaomiSpeakerConfig
+
+async def main():
+    speaker = XiaomiSpeaker(XiaomiSpeakerConfig(speaker_name="${escapeHtml((device && device.name) || '客厅')}"))
+    await speaker.connect()
+    await speaker.speak("机器人已接管，请说话。")   # 接管播报
+    async for request_id, question in speaker.listen_asr():   # 监听新的 ASR
+        print("heard:", question)
+        await speaker.speak(f"你说了：{question}")
+
+asyncio.run(main())</pre>
+      <p class="login-msg">
+        完整示例见 ssr-agent 仓库 <code>xiaomi_speaker_sdk/examples/echo_bot.py</code> 和
+        <code>xiaomi_speaker_sdk/examples/webhook_forwarder.py</code>（后者与本页「Webhook 推送」
+        功能等价，可在没有本应用的情况下独立运行）。
+      </p>
+    </div>`;
+
+  wrap.innerHTML = `<div class="xm-grid">${tokenCard}${speakerCard}${webhookCard}${speakCard}${guideCard}</div>`;
+  bindXiaomiEvents();
+}
+
+function bindXiaomiEvents() {
+  const extractBtn = $('#xm-extract-btn');
+  if (extractBtn) extractBtn.addEventListener('click', xiaomiExtractToken);
+
+  $$('input[name="xm-speaker"]').forEach((r) => {
+    r.addEventListener('change', () => { XIAOMI.selectedDid = r.value; });
+  });
+  const selectBtn = $('#xm-select-btn');
+  if (selectBtn) selectBtn.addEventListener('click', xiaomiSelectSpeaker);
+
+  const saveBtn = $('#xm-save-config-btn');
+  if (saveBtn) saveBtn.addEventListener('click', xiaomiSaveConfig);
+  const toggleBtn = $('#xm-toggle-bridge-btn');
+  if (toggleBtn) toggleBtn.addEventListener('click', xiaomiToggleBridge);
+
+  const speakBtn = $('#xm-speak-btn');
+  if (speakBtn) speakBtn.addEventListener('click', xiaomiSpeak);
+}
+
+async function xiaomiExtractToken() {
+  const btn = $('#xm-extract-btn');
+  btn.disabled = true;
+  btn.textContent = '等待登录…（请在弹出的窗口中登录）';
+  try {
+    const cred = await window.miot.xiaomiPassportLogin();
+    if (!cred) {
+      toast('登录窗口已关闭，未获取到 Token', 'err');
+      return;
+    }
+    const r = await apiPost('/api/xiaomi/token', { passToken: cred.passToken, userId: cred.userId });
+    if (r.ok) {
+      toast('Token 提取成功', 'ok');
+    } else {
+      toast('Token 已保存，但登录校验失败：' + (r.error || ''), 'err');
+    }
+    await loadXiaomi();
+  } catch (e) {
+    toast('提取 Token 失败：' + e.message, 'err');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '提取 Token（登录小米账号）';
+  }
+}
+
+async function xiaomiSelectSpeaker() {
+  const checked = document.querySelector('input[name="xm-speaker"]:checked');
+  if (!checked) { toast('请先选择一个音箱', 'err'); return; }
+  try {
+    await apiPost('/api/xiaomi/select', { did: checked.value, name: checked.dataset.name });
+    toast('已选择音箱', 'ok');
+    await loadXiaomi();
+  } catch (e) {
+    toast('选择失败：' + e.message, 'err');
+  }
+}
+
+async function xiaomiSaveConfig() {
+  const webhookUrl = $('#xm-webhook-url').value.trim();
+  const wakeWord = $('#xm-wake-word').value.trim();
+  try {
+    await apiPost('/api/xiaomi/config', { webhook_url: webhookUrl, wake_word: wakeWord });
+    toast('配置已保存', 'ok');
+    XIAOMI.bridge = await api('/api/xiaomi/bridge/status');
+  } catch (e) {
+    toast('保存失败：' + e.message, 'err');
+  }
+}
+
+async function xiaomiToggleBridge() {
+  const btn = $('#xm-toggle-bridge-btn');
+  btn.disabled = true;
+  try {
+    if (XIAOMI.bridge.running) {
+      await apiPost('/api/xiaomi/bridge/stop', {});
+      toast('已停止推送', 'ok');
+    } else {
+      await xiaomiSaveConfig();
+      await apiPost('/api/xiaomi/bridge/start', {});
+      toast('已启动推送', 'ok');
+    }
+    await loadXiaomi();
+  } catch (e) {
+    toast('操作失败：' + e.message, 'err');
+    btn.disabled = false;
+  }
+}
+
+async function xiaomiSpeak() {
+  const text = $('#xm-speak-text').value.trim();
+  if (!text) { toast('请输入要播报的文字', 'err'); return; }
+  const btn = $('#xm-speak-btn');
+  btn.disabled = true;
+  try {
+    await apiPost('/api/xiaomi/speak', { text });
+    toast('已下发播报', 'ok');
+  } catch (e) {
+    toast('播报失败：' + e.message, 'err');
+  } finally {
+    btn.disabled = false;
+  }
+}
 
 boot();

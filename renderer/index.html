@@ -16,6 +16,7 @@
     <nav class="tabs">
       <button class="tab active" data-tab="devices">设备控制</button>
       <button class="tab" data-tab="cameras">摄像头</button>
+      <button class="tab" data-tab="xiaomi">小爱音箱</button>
     </nav>
     <div class="topbar-right">
       <span id="status-dot" class="status-dot offline" title="后端状态"></span>
@@ -69,6 +70,13 @@
       <div class="camera-wrap">
         <div id="camera-banner" class="banner hidden"></div>
         <div id="camera-grid" class="camera-grid"></div>
+      </div>
+    </section>
+
+    <!-- ===================== XIAOMI (XiaoAI speaker) ===================== -->
+    <section id="tab-xiaomi" class="tab-panel">
+      <div class="xiaomi-wrap" id="xiaomi-wrap">
+        <div class="loading"><span class="spinner"></span> 加载中…</div>
       </div>
     </section>
   </main>

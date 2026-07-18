@@ -161,6 +161,62 @@ ipcMain.handle('oauth-login', (e, authUrl) => {
 });
 
 // ---------------------------------------------------------------------------
+// XiaoAI passport login: capture passToken/userId cookies for the ASR/TTS
+// bridge (a different credential than the MIoT OAuth2 login above — see the
+// "小爱音箱" tab). Electron can read httpOnly cookies straight out of the
+// window's session, so no external browser + DevTools Protocol dance is
+// needed: open the Mi passport login page, let the user sign in (completing
+// any safety verification themselves), then poll session.cookies for the
+// result.
+// ---------------------------------------------------------------------------
+const XIAOMI_PASSPORT_LOGIN_URL =
+  'https://account.xiaomi.com/pass/serviceLogin?sid=micoapi&_locale=zh_CN';
+
+ipcMain.handle('xiaomi-passport-login', (e) => {
+  return new Promise((resolve) => {
+    const parent = BrowserWindow.fromWebContents(e.sender);
+    const loginWindow = new BrowserWindow({
+      width: 480,
+      height: 680,
+      parent: parent || undefined,
+      modal: !!parent,
+      title: '登录小米账号（获取小爱音箱 Token）',
+      autoHideMenuBar: true,
+      webPreferences: { contextIsolation: true, nodeIntegration: false },
+    });
+    loginWindow.removeMenu();
+    const ses = loginWindow.webContents.session;
+
+    let settled = false;
+    let pollTimer = null;
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      if (pollTimer) clearInterval(pollTimer);
+      resolve(result);
+      if (!loginWindow.isDestroyed()) loginWindow.close();
+    };
+
+    const checkCookies = async () => {
+      try {
+        const [passTokenCookies, userIdCookies] = await Promise.all([
+          ses.cookies.get({ domain: 'xiaomi.com', name: 'passToken' }),
+          ses.cookies.get({ domain: 'xiaomi.com', name: 'userId' }),
+        ]);
+        const passToken = (passTokenCookies.find((c) => c.value) || {}).value;
+        const userId = (userIdCookies.find((c) => c.value) || {}).value;
+        if (passToken && userId) finish({ passToken, userId });
+      } catch (err) {
+        // transient — keep polling
+      }
+    };
+    pollTimer = setInterval(checkCookies, 1500);
+    loginWindow.on('closed', () => finish(null));
+    loginWindow.loadURL(XIAOMI_PASSPORT_LOGIN_URL);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Windows
 // ---------------------------------------------------------------------------
 function createMainWindow() {

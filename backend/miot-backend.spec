@@ -25,6 +25,7 @@ for pkg in [
     'pydantic', 'pydantic_core',
     'aiohttp', 'aiocache', 'aiofiles',
     'zeroconf', 'cryptography', 'yaml', 'psutil',
+    'miservice',
 ]:
     try:
         d, b, h = collect_all(pkg)

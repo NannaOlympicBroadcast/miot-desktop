@@ -108,6 +108,8 @@ from miot.types import (  # noqa: E402
     MIoTActionParam,
 )
 
+import xiaomi_asr_bridge  # noqa: E402
+
 
 # ---------------------------------------------------------------------------
 # Spec serialisation: turn a parsed MIoTSpecDevice into renderer-friendly JSON
@@ -221,6 +223,9 @@ BE = Backend()
 # OAuth login session: holds the temporary MIoTClient created by /api/auth/start
 # and the state token needed to complete the exchange.
 _AUTH: Dict[str, Any] = {"client": None, "uuid": None, "state": None}
+
+# XiaoAI ASR/TTS bridge (separate Mi passport credential — see xiaomi_asr_bridge.py).
+ASR = xiaomi_asr_bridge.XiaomiAsrBridge()
 
 
 def _parse_code_state(body: Dict[str, Any], fallback_state: Optional[str] = None) -> tuple:
@@ -556,6 +561,118 @@ async def ws_camera(request: web.Request) -> web.WebSocketResponse:
     return ws
 
 
+# ---------------------------------------------------------------------------
+# XiaoAI (小爱音箱) ASR/TTS bridge handlers
+#
+# Separate credential from the MIoT OAuth2 login above (see xiaomi_asr_bridge.py
+# for why). The Mi passport token is obtained via an in-app browser login
+# window (main.js `xiaomi-passport-login`, harvested from session cookies) and
+# posted here; the speaker to use is picked from the user's *already known*
+# miot devices (h_xiaomi_speaker_candidates), then cross-referenced against
+# the MiNA account's speakers.
+# ---------------------------------------------------------------------------
+async def h_xiaomi_status(request: web.Request) -> web.Response:
+    return _json({
+        "has_token": ASR.has_token(),
+        "device": ASR.device,
+        "config": ASR.config,
+    })
+
+
+async def h_xiaomi_token_info(request: web.Request) -> web.Response:
+    return _json(ASR.token_info())
+
+
+async def h_xiaomi_token_post(request: web.Request) -> web.Response:
+    try:
+        body = await request.json()
+        pass_token = body.get("passToken") or body.get("pass_token")
+        user_id = body.get("userId") or body.get("user_id")
+        if not pass_token or not user_id:
+            return _err("缺少 passToken 或 userId", 400)
+        await ASR.import_token(pass_token, user_id)
+        ok, error = await ASR.test_login()
+        return _json({"ok": ok, "error": error})
+    except Exception as err:  # pylint: disable=broad-except
+        return _err(str(err))
+
+
+async def h_xiaomi_speaker_candidates(request: web.Request) -> web.Response:
+    """Speakers picked from the user's *already logged-in* miot device list
+    (not a raw MiNA dropdown) so the name is one they recognise."""
+    if not BE.ready:
+        return _err("请先在「设备控制」完成小米账号登录，才能按已知设备选择音箱。", 400)
+    try:
+        devices = await BE.client.get_devices_async()
+        pattern = xiaomi_asr_bridge.speaker_candidate_pattern()
+        out = []
+        for did, dev in devices.items():
+            d = dev.model_dump()
+            name = d.get("name", "") or ""
+            model = d.get("model", "") or ""
+            if pattern.search(model) or pattern.search(name):
+                d["did"] = did
+                out.append(d)
+        return _json(out)
+    except Exception as err:  # pylint: disable=broad-except
+        return _client_err(err)
+
+
+async def h_xiaomi_select(request: web.Request) -> web.Response:
+    try:
+        body = await request.json()
+        did = body.get("did") or ""
+        name = body.get("name") or ""
+        if not did and not name:
+            return _err("缺少 did", 400)
+        device = await ASR.select_by_did(did, fallback_name=name)
+        return _json({"device": device})
+    except Exception as err:  # pylint: disable=broad-except
+        return _err(str(err))
+
+
+async def h_xiaomi_config_get(request: web.Request) -> web.Response:
+    return _json(ASR.config)
+
+
+async def h_xiaomi_config_post(request: web.Request) -> web.Response:
+    try:
+        body = await request.json()
+        ASR.set_webhook(body.get("webhook_url", ""), body.get("wake_word", ""))
+        return _json({"ok": True, "config": ASR.config})
+    except Exception as err:  # pylint: disable=broad-except
+        return _err(str(err))
+
+
+async def h_xiaomi_bridge_start(request: web.Request) -> web.Response:
+    try:
+        await ASR.start_bridge()
+        return _json(ASR.bridge_status())
+    except Exception as err:  # pylint: disable=broad-except
+        return _err(str(err))
+
+
+async def h_xiaomi_bridge_stop(request: web.Request) -> web.Response:
+    await ASR.stop_bridge()
+    return _json(ASR.bridge_status())
+
+
+async def h_xiaomi_bridge_status(request: web.Request) -> web.Response:
+    return _json(ASR.bridge_status())
+
+
+async def h_xiaomi_speak(request: web.Request) -> web.Response:
+    try:
+        body = await request.json()
+        text = (body.get("text") or "").strip()
+        if not text:
+            return _err("缺少 text", 400)
+        await ASR.speak(text)
+        return _json({"ok": True})
+    except Exception as err:  # pylint: disable=broad-except
+        return _err(str(err))
+
+
 async def on_startup(app: web.Application) -> None:
     try:
         await BE.init()
@@ -566,6 +683,7 @@ async def on_startup(app: web.Application) -> None:
 
 async def on_cleanup(app: web.Application) -> None:
     await BE.deinit()
+    await ASR.close()
 
 
 def build_app() -> web.Application:
@@ -584,6 +702,17 @@ def build_app() -> web.Application:
     app.router.add_post("/api/prop/set", h_prop_set)
     app.router.add_post("/api/action", h_action)
     app.router.add_get("/ws/camera", ws_camera)
+    app.router.add_get("/api/xiaomi/status", h_xiaomi_status)
+    app.router.add_get("/api/xiaomi/token", h_xiaomi_token_info)
+    app.router.add_post("/api/xiaomi/token", h_xiaomi_token_post)
+    app.router.add_get("/api/xiaomi/speaker-candidates", h_xiaomi_speaker_candidates)
+    app.router.add_post("/api/xiaomi/select", h_xiaomi_select)
+    app.router.add_get("/api/xiaomi/config", h_xiaomi_config_get)
+    app.router.add_post("/api/xiaomi/config", h_xiaomi_config_post)
+    app.router.add_post("/api/xiaomi/bridge/start", h_xiaomi_bridge_start)
+    app.router.add_post("/api/xiaomi/bridge/stop", h_xiaomi_bridge_stop)
+    app.router.add_get("/api/xiaomi/bridge/status", h_xiaomi_bridge_status)
+    app.router.add_post("/api/xiaomi/speak", h_xiaomi_speak)
     app.on_startup.append(on_startup)
     app.on_cleanup.append(on_cleanup)
     return app

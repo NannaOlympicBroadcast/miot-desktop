@@ -11,5 +11,9 @@ zeroconf>=0.147
 psutil>=7.0
 av>=12
 pillow>=10.3
+# XiaoAI (小爱音箱) ASR/TTS bridge — see backend/xiaomi_asr_bridge.py. Same Mi
+# cloud protocol wrapper used by ssr-agent's XiaoAI channel and the standalone
+# xiaomi-speaker-sdk package.
+miservice_fork>=2.9
 # build tool
 pyinstaller>=6.10

@@ -11,6 +11,10 @@
 - 🪟 **托盘驻留**：点击关闭按钮收起到系统托盘；托盘右键可「显示主界面 / 快捷控制面板 / 退出」。
 - 🎛️ **快捷控制面板**：托盘弹出的小窗，可直接调节默认音箱音量、播放/暂停，并
   **非静默执行自然语言指令**。
+- 🗣️ **小爱音箱**：应用内登录小米账号获取小爱语音识别 (ASR) / 语音播报 (TTS) 所需的
+  passport Token（与设备控制的 OAuth2 登录是两套不同凭据），可从已有的米家音箱设备中选择
+  一个，把新的语音识别结果实时推送到自定义 Webhook；同时提供接管播报测试，以及如何用独立的
+  `xiaomi-speaker-sdk` 开发自己的小爱音箱机器人的图文指引（见下方「关于小爱音箱」）。
 - ⚙️ **开机自启**：设置中可开启「开机自动启动」（登录后静默驻留托盘）。
 
 ## 架构
@@ -66,6 +70,31 @@ npm start          # 启动应用
     其余 → 文本框。只读属性提供「读取」按钮，动作提供「执行」按钮。
   - 顶部「读取全部状态」一次性批量拉取所有可读属性的当前值。
 - **摄像头**：切换到「摄像头」标签查看设备列表，点「播放」拉流。
+- **小爱音箱**：切换到「小爱音箱」标签，见下方「关于小爱音箱」。
+
+## 关于小爱音箱
+
+小爱音箱的语音识别 (ASR) / 语音播报 (TTS) 使用的是小米账号的 **passport 登录凭据**
+（`passToken`），与本应用其余功能使用的**米家开放平台 OAuth2** 登录是两套不同的凭据——
+后者只能用于 SPEC 设备控制，无法用于小爱对话。这个 Token 通常需要在浏览器里完成一次登录
+（可能包含短信/设备安全验证）才能拿到。
+
+「小爱音箱」标签页做了三件事：
+
+1. **提取 Token**：点击按钮后，`main.js` 会打开一个应用内的登录窗口（`xiaomi-passport-login`
+   IPC handler）加载小米账号登录页；成功登录后直接从该窗口的 `session.cookies` 读取
+   `passToken`/`userId`（Electron 原生支持读取 httpOnly cookie，不需要像纯 CLI 工具那样
+   另外拉起浏览器 + DevTools Protocol 去抓包）。Token 保存在本地
+   `~/.miot_cache/xiaomi_speaker/token.json`（后端 `xiaomi_asr_bridge.py`），与
+   `~/.miot_cache` 下的 OAuth2 缓存互不影响。
+2. **选择音箱 + 推送到 Webhook**：音箱直接从你**米家账号下已有的设备列表**中选（而不是一份
+   陌生的原始小爱设备 ID 列表），选中后由后端按 MIoT DID 去匹配小爱账号下的对应设备；随后可
+   配置一个 Webhook 地址，收到新的语音识别结果时实时 `POST` 一份 JSON 过去。也提供「接管播报
+   测试」按钮，验证随时暂停播放、朗读任意文字的能力。
+3. **SDK 开发指引**：页面底部有图文说明，指导如何把提取到的 Token 接到独立发布的
+   [`xiaomi-speaker-sdk`](https://github.com/NannaOlympicBroadcast/ssr-agent/tree/main/xiaomi_speaker_sdk)
+   包（同一套 `miservice` Token 格式，可直接复用 Token 文件）上，用几行代码监听 ASR / 接管
+   播报，开发自己的小爱音箱机器人——不依赖本应用即可运行。
 
 ## 关于摄像头实时画面
 
@@ -121,11 +150,12 @@ miot-desktop/
 ├── main.js               # 主进程：启动后端(dev=python / prod=exe) + 窗口 + 托盘 + 自启
 ├── preload.js            # contextBridge 暴露后端地址与 IPC
 ├── backend/
-│   ├── server.py         # aiohttp 后端，封装 miot_kit（含登录/设备/SPEC/摄像头）
+│   ├── server.py           # aiohttp 后端，封装 miot_kit（含登录/设备/SPEC/摄像头/小爱音箱路由）
+│   ├── xiaomi_asr_bridge.py # 小爱音箱 passport 登录 + ASR 轮询 + Webhook 推送 + TTS 接管
 │   ├── requirements.txt
-│   └── miot-backend.spec # PyInstaller 打包脚本
+│   └── miot-backend.spec   # PyInstaller 打包脚本
 ├── renderer/
-│   ├── index.html / styles.css / app.js   # 主界面：登录、设备、SPEC 控件、摄像头、设置
+│   ├── index.html / styles.css / app.js   # 主界面：登录、设备、SPEC 控件、摄像头、小爱音箱、设置
 │   └── quick.html / quick.js              # 托盘快捷控制面板
 ├── vendor/miot_kit/miot/ # 内置的 miot 库（供打包）
 ├── build/icon.ico        # 应用图标

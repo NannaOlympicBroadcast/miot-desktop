@@ -14,5 +14,6 @@ contextBridge.exposeInMainWorld('miot', {
   hideWindow: () => ipcRenderer.invoke('hide-window'),
   broadcast: (channel) => ipcRenderer.invoke('broadcast', channel),
   oauthLogin: (authUrl) => ipcRenderer.invoke('oauth-login', authUrl),
+  xiaomiPassportLogin: () => ipcRenderer.invoke('xiaomi-passport-login'),
   on: (channel, cb) => ipcRenderer.on(channel, () => cb()),
 });
