@@ -951,7 +951,7 @@ async function milocoShowLogs() {
 // ===========================================================================
 // SSR agent chat (bundled agent driving Miloco + general assistant)
 // ===========================================================================
-let AGENT = { status: null, ws: null, pending: [], history: [], busy: false };
+let AGENT = { status: null, ws: null, pending: [], history: [], busy: false, toolSeq: 0, openTools: [] };
 
 async function loadAgent() {
   const wrap = $('#agent-wrap');
@@ -1097,9 +1097,40 @@ function renderAgentHistory() {
     if (m.role === 'user') return `<div class="msg user"><div class="bubble">${escapeHtml(m.text)}</div></div>`;
     if (m.role === 'assistant') return `<div class="msg assistant"><div class="bubble">${escapeHtml(m.text)}</div></div>`;
     if (m.role === 'event') return `<div class="msg event">${escapeHtml(m.text)}</div>`;
+    if (m.role === 'tool') return renderToolCard(m);
     return '';
   }).join('');
   log.scrollTop = log.scrollHeight;
+}
+
+function summarizeArgs(args) {
+  if (args == null) return '';
+  let s;
+  if (typeof args === 'object') {
+    if (!Object.keys(args).length) return '';
+    try { s = JSON.stringify(args); } catch (e) { return ''; }
+  } else {
+    s = String(args);
+  }
+  return s.length > 200 ? s.slice(0, 200) + '…' : s;
+}
+
+function summarizeResult(result) {
+  const s = String(result == null ? '' : result);
+  return s.length > 400 ? s.slice(0, 400) + '…' : s;
+}
+
+function renderToolCard(m) {
+  const running = m.status === 'running';
+  const icon = running ? '<span class="tool-spinner"></span>' : (m.error ? '⚠️' : '✓');
+  const args = summarizeArgs(m.args);
+  return `<div class="msg tool">
+    <div class="tool-card ${running ? 'running' : 'done'}${m.error ? ' error' : ''}">
+      <div class="tool-head">${icon} 调用工具 <span class="tool-name">${escapeHtml(m.name || '')}</span>${running ? '…' : ''}</div>
+      ${args ? `<div class="tool-args">${escapeHtml(args)}</div>` : ''}
+      ${!running && m.result != null ? `<div class="tool-result">${escapeHtml(summarizeResult(m.result))}</div>` : ''}
+    </div>
+  </div>`;
 }
 
 function ensureAgentWs() {
@@ -1117,13 +1148,19 @@ function ensureAgentWs() {
 function handleAgentEvent(evt) {
   const t = evt.type;
   if (t === 'thinking' && evt.text) pushEventLine('💭 ' + evt.text);
-  else if (t === 'tool_call') pushEventLine('🔧 调用工具 ' + (evt.name || evt.tool || ''));
-  else if (t === 'tool_result') pushEventLine('✓ 工具返回');
-  else if (t === 'reply' || t === 'done') {
-    const text = evt.text || evt.reply || '';
+  else if (t === 'tool_call') pushToolCall(evt);
+  else if (t === 'tool_result') pushToolResult(evt);
+  else if (t === 'reply') {
+    // The authoritative content event: emitted once per turn by the agent
+    // itself, streamed live. The 'done' event that follows is only a
+    // completion signal (busy state) — it must NOT also append text, or the
+    // same reply is shown twice.
+    const text = evt.text || '';
     if (text) AGENT.history.push({ role: 'assistant', text });
-    if (t === 'done') { AGENT.busy = false; setAgentSending(false); }
     renderAgentHistory();
+  } else if (t === 'done') {
+    AGENT.busy = false;
+    setAgentSending(false);
   } else if (t === 'error') {
     AGENT.history.push({ role: 'event', text: '出错：' + (evt.message || '') });
     AGENT.busy = false; setAgentSending(false);
@@ -1134,6 +1171,32 @@ function handleAgentEvent(evt) {
 function pushEventLine(text) {
   // Coalesce consecutive event lines to keep the log tidy.
   AGENT.history.push({ role: 'event', text });
+  renderAgentHistory();
+}
+
+function pushToolCall(evt) {
+  const id = ++AGENT.toolSeq;
+  AGENT.openTools.push(id);
+  AGENT.history.push({ role: 'tool', id, name: evt.name || evt.tool || '', args: evt.args, status: 'running' });
+  renderAgentHistory();
+}
+
+function pushToolResult(evt) {
+  // Tool calls execute strictly sequentially within a turn (call -> result,
+  // call -> result, ...), so the oldest still-open call is always the one
+  // this result belongs to.
+  const id = AGENT.openTools.shift();
+  const entry = AGENT.history.find((m) => m.role === 'tool' && m.id === id);
+  if (entry) {
+    entry.status = 'done';
+    entry.result = evt.result;
+    entry.error = /^ERROR:/.test(String(evt.result || ''));
+  } else {
+    AGENT.history.push({
+      role: 'tool', id: ++AGENT.toolSeq, name: evt.name || evt.tool || '',
+      status: 'done', result: evt.result,
+    });
+  }
   renderAgentHistory();
 }
 
@@ -1153,6 +1216,7 @@ async function agentSend() {
   const attachments = AGENT.pending.slice();
   AGENT.history.push({ role: 'user', text: text + (attachments.length ? `  [${attachments.length} 个附件]` : '') });
   AGENT.pending = [];
+  AGENT.openTools = [];
   renderAttachments();
   renderAgentHistory();
   $('#ag-text').value = '';

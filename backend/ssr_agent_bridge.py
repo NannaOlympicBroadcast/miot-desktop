@@ -50,6 +50,7 @@ class SSRAgentBridge:
         self._settings = None
         self._lock = threading.Lock()
         self._miloco_bridge = None
+        self._miloco_webhook_fallback = None
         self._import_error: Optional[str] = None
 
     # ------------------------------------------------------------ availability
@@ -67,10 +68,23 @@ class SSRAgentBridge:
                 return self._agent
             from ssr.agent.core import SSRAgent
             self._settings = self._load_settings()
+            # Scope this app's agent to smart-home duty (butler persona +
+            # Miloco device-type reference doc) instead of the generic coding-
+            # agent default — this *is* the "SSR 助手" driving Mi Home, not a
+            # general-purpose assistant. Best-effort: degrades to the base
+            # persona (no live device catalog / home profile) when miloco-cli
+            # isn't installed or Miloco isn't running yet.
+            try:
+                from ssr.integrations.miloco import apply_smart_home_scope
+                apply_smart_home_scope(self._settings)
+            except Exception as e:  # pylint: disable=broad-except
+                _LOGGER.info("Miloco smart-home scoping not applied: %s", e)
             self._agent = SSRAgent(self._settings)
             # Attach the Miloco activity → bus bridge so home events reach any
-            # SSR bus-event handlers. Best-effort: unsupported platform / miloco
-            # off simply returns None.
+            # SSR bus-event handlers, and start the /miloco/webhook receiver
+            # (ssr.integrations.miloco.start_bus_bridge) so Miloco's own
+            # perception/rule engine can drive this same agent directly.
+            # Best-effort: unsupported platform / miloco off simply returns None.
             try:
                 from ssr.integrations.miloco import start_bus_bridge
                 self._miloco_bridge = start_bus_bridge(self._agent)
@@ -256,6 +270,30 @@ class SSRAgentBridge:
         finally:
             if observer is not None:
                 agent.remove_event_observer(observer)
+
+    # ------------------------------------------------------------ miloco webhook
+    def handle_miloco_webhook(self, body: Dict[str, Any]) -> Dict[str, Any]:
+        """Handle one Miloco agent-webhook request: ``{action, payload}`` ->
+        ``{code, message, data}``.
+
+        This is an *alternative* entry point to the same receiver
+        ``ssr.integrations.miloco.start_bus_bridge`` already runs on its own
+        fixed port (Miloco's default ``agent.webhook_url``); exposing it here
+        too lets Miloco reach this backend's own REST port instead, and keeps
+        working if that fixed port could not be bound. Reuses the *same*
+        handler/session pool as the bus bridge when available, so both
+        entry points share consistent per-sessionKey conversation state.
+        """
+        self._build_agent()  # ensures self._miloco_bridge is set, best-effort
+        handler = getattr(self._miloco_bridge, "handler", None)
+        if handler is None:
+            if self._miloco_webhook_fallback is None:
+                from ssr.agent.core import SSRAgent
+                from ssr.integrations.miloco import MilocoAgentHandler
+                settings = self._settings or self._load_settings()
+                self._miloco_webhook_fallback = MilocoAgentHandler(lambda: SSRAgent(settings))
+            handler = self._miloco_webhook_fallback
+        return handler.handle(body)
 
     def _save_upload(self, agent, name: str, raw: bytes) -> str:
         base = Path(getattr(agent.settings, "project_dir", Path.cwd())) / "uploads"

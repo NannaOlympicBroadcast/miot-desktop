@@ -675,6 +675,25 @@ async def h_agent_models_post(request: web.Request) -> web.Response:
         return _err(str(err))
 
 
+async def h_miloco_webhook(request: web.Request) -> web.Response:
+    """Miloco's agent-webhook contract: ``{action, payload}`` -> ``{code,
+    message, data}`` (always HTTP 200; failure is signalled via ``code``).
+
+    Alternative entry point to the fixed-port receiver
+    ``ssr.integrations.miloco.start_bus_bridge`` already runs — see
+    ``ssr_agent_bridge.SSRAgentBridge.handle_miloco_webhook``.
+    """
+    if not AGENT.available():
+        return _json({"code": 1, "message": "SSR agent 不可用", "data": None})
+    try:
+        body = await request.json()
+    except (json.JSONDecodeError, TypeError):
+        return _json({"code": 1, "message": "invalid json", "data": None})
+    loop = asyncio.get_event_loop()
+    result = await loop.run_in_executor(None, AGENT.handle_miloco_webhook, body)
+    return _json(result)
+
+
 async def ws_agent(request: web.Request) -> web.WebSocketResponse:
     """Chat WebSocket. Client sends {type:'chat', text, attachments:[…]}; the
     server streams the agent's live events and a final {type:'done', reply}."""
@@ -779,6 +798,7 @@ def build_app() -> web.Application:
     app.router.add_get("/api/agent/models", h_agent_models_get)
     app.router.add_post("/api/agent/models", h_agent_models_post)
     app.router.add_get("/ws/agent", ws_agent)
+    app.router.add_post("/miloco/webhook", h_miloco_webhook)
     app.on_startup.append(on_startup)
     app.on_cleanup.append(on_cleanup)
     return app

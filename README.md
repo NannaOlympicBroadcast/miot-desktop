@@ -9,9 +9,11 @@
 - 🏠 **Miloco**：通过界面用 Docker（`--network host`）一键启动/停止小米官方的感知家庭网关
   [Xiaomi Miloco](https://github.com/XiaoMi/xiaomi-miloco)，**自动把本机米家凭据注入给
   Miloco**（无需重新绑定账号），并在应用内预览 Miloco 的 Web 控制台（见下方「关于 Miloco」）。
-- 🤖 **SSR 助手**：内置进 Python 运行时的 SSR 智能体作为主 Agent，可在界面上配置模型、进行
-  聊天（支持**粘贴图片 / 上传文件**）；Miloco 的家庭事件会进入 SSR 的事件总线，供 bus event
-  handler 处理（见下方「关于 SSR 助手」）。
+- 🤖 **SSR 助手**：内置进 Python 运行时的 SSR minimal runtime 智能体作为主 Agent（已限定为智能家居
+  管家人设，装载 Miloco 的设备/感知/任务/规则数据类型作为上下文），可在界面上配置模型、进行
+  聊天（支持**粘贴图片 / 上传文件**，工具调用流式可视化）；Miloco 的家庭事件会进入 SSR 的事件
+  总线供 bus event handler 处理，Miloco 的感知/规则引擎也可通过 `/miloco/webhook` 直接驱动同一个
+  Agent（见下方「关于 SSR 助手」）。
 - 🪟 **托盘驻留**：点击关闭按钮收起到系统托盘；托盘右键可「显示主界面 / 快捷控制面板 / 退出」。
 - 🎛️ **快捷控制面板**：托盘弹出的小窗，可直接调节默认音箱音量、播放/暂停，并
   **非静默执行自然语言指令**。
@@ -124,19 +126,31 @@ npm start          # 启动应用
 
 ## 关于 SSR 助手
 
-[SSR](https://github.com/NannaOlympicBroadcast/ssr-agent) 是一个命令行智能体，被**内置进本应用的
-Python 运行时**作为驱动 Miloco 的主 Agent（后端 `ssr_agent_bridge.py`）。「SSR 助手」标签页：
+[SSR minimal runtime](https://github.com/NannaOlympicBroadcast/ssr-minimal) 是一个基于
+Google ADK 的 code-driven agent 运行时，被**内置进本应用的 Python 运行时**作为驱动 Miloco 的主
+Agent（后端 `ssr_agent_bridge.py`）。相比早期基于完整 `ssr-agent`（CLI/TUI + IM 渠道 + 插件系统
++ 云配对）的实现，minimal runtime 只保留 agent 循环、上下文池、事件总线与 SDK，打包依赖显著更少
+（无 `rich`/`pyfiglet`/`prompt_toolkit` 等 CLI/TUI 依赖，见 `miot-backend.spec`），Python 包名
+仍是 `ssr`，`ssr_agent_bridge.py` 的调用方式不变。「SSR 助手」标签页：
 
 1. **模型配置**：读写 SSR 自己的 `~/.ssr/models.json` 与 `~/.ssr/.env`，可设置主模型
    （provider / 模型名 / API Key / Base URL）。
-2. **聊天**：通过 `/ws/agent` WebSocket 与 `SSRAgent` 对话，实时streaming
-   `turn_start`/`thinking`/`tool_call`/`tool_result`/`reply` 事件。支持**粘贴图片**（作为多模态
-   图片输入）与**上传文件**（保存到 Agent 工作目录，供其用文件工具读取）。
-3. **Miloco → 总线**：启动时挂载 SSR 的 `MilocoActivityBridge`，把 Miloco 的家庭活动事件
-   （`miloco.activity.*`）投递到 SSR 事件总线，供 SSR 的 bus event handler 实时响应。
+2. **聊天**：通过 `/ws/agent` WebSocket 与 `SSRAgent` 对话，实时 streaming
+   `turn_start`/`thinking`/`tool_call`/`tool_result`/`reply` 事件（工具调用/返回值在界面上以独立卡片
+   实时展示）。支持**粘贴图片**（作为多模态图片输入）与**上传文件**（保存到 Agent 工作目录，供其
+   用文件工具读取）。
+3. **智能家居人设 + Miloco 数据类型**：`ssr.integrations.miloco.apply_smart_home_scope` 把 Agent
+   人设限定为智能家居管家，并把 Miloco 的设备目录 / 感知事件 / 任务 / 规则数据类型作为 embedded
+   context 装载，使其只处理智能家居相关请求。
+4. **Miloco ⇄ 总线 / Webhook 双向打通**：启动时挂载 `ssr.integrations.miloco.start_bus_bridge`——
+   一边把 Miloco 的连通性变化投递到 SSR 事件总线供 bus event handler 响应，一边在 Miloco 默认的
+   agent webhook 端口（`18789`）启动 `/miloco/webhook` 接收端；`miloco_controller.py` 启动 Miloco
+   容器时会把该地址与一个共享 bearer token 写入 Miloco 的 `config.json::agent`，让 Miloco 的感知/
+   规则引擎可以直接调用同一个 Agent（本应用的 `/miloco/webhook` REST 路由是等价的备用入口）——这就
+   是「自动化事件让 SSR 助手直接处理」的落地。
 
-未在后端 Python 环境安装 ssr-agent 时，该标签页会给出安装指引而不会影响其它功能
-（可 `pip install ssr-agent`，或设置 `SSR_AGENT_PATH` 指向其源码目录）。
+未在后端 Python 环境安装 SSR minimal runtime 时，该标签页会给出安装指引而不会影响其它功能
+（可 `pip install ssr-agent-minimal`，或设置 `SSR_AGENT_PATH` 指向其源码目录）。
 
 ## 打包为独立 exe（内置 Python 运行环境）
 
