@@ -30,6 +30,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import secrets
 import shutil
 import sqlite3
@@ -61,6 +62,73 @@ _DOCKERFILE_DIR = Path(os.environ.get(
 
 MIOT_TOKEN_INFO_KEY = "MIOT_TOKEN_INFO_KEY"
 
+# ---------------------------------------------------------------------------
+# Docker build mirrors — presets the "构建镜像" UI can pick from (app.js),
+# resolved server-side so the client only ever sends a preset name or a raw
+# custom URL/host/prefix. "default" leaves the corresponding Dockerfile ARG
+# at its upstream default. Mirrors the same preset set ssr-minimal's own
+# scripts/docker_build.py documents (not guaranteed to stay up forever —
+# just common, currently-working options for restricted/CN networks).
+# ---------------------------------------------------------------------------
+PIP_MIRRORS = {
+    "default": "https://pypi.org/simple",
+    "tsinghua": "https://pypi.tuna.tsinghua.edu.cn/simple",
+    "aliyun": "https://mirrors.aliyun.com/pypi/simple",
+    "ustc": "https://pypi.mirrors.ustc.edu.cn/simple",
+    "tencent": "https://mirrors.cloud.tencent.com/pypi/simple",
+}
+APT_MIRRORS = {
+    "default": "",  # leave apt's built-in sources alone
+    "aliyun": "mirrors.aliyun.com",
+    "tsinghua": "mirrors.tuna.tsinghua.edu.cn",
+    "ustc": "mirrors.ustc.edu.cn",
+    "tencent": "mirrors.cloud.tencent.com",
+}
+REGISTRY_MIRRORS = {
+    "default": "",  # pull the base image from docker.io directly
+    "daocloud": "docker.m.daocloud.io",
+}
+_BASE_IMAGE = "python:3.11-slim"
+
+
+def _resolve_mirror(value: str, presets: Dict[str, str]) -> str:
+    return presets.get(value, value)
+
+
+# ---------------------------------------------------------------------------
+# `docker build --progress=plain` step parser — turns the `#N <event>` line
+# stream into structured per-step state (id/title/status/duration/error) so
+# the UI can render a live step list instead of a raw scrolling log. Mirrors
+# the parser in ssr-minimal's scripts/docker_build.py (duplicated rather than
+# imported: miot-desktop doesn't depend on that repo's dev-tooling package).
+# ---------------------------------------------------------------------------
+_STEP_RE = re.compile(r"^#(\d+) (.*)$")
+_STEP_DONE_RE = re.compile(r"^DONE (\d+(?:\.\d+)?)s$")
+
+
+def _parse_build_line(steps: Dict[str, Dict[str, Any]], order: List[str], line: str) -> None:
+    m = _STEP_RE.match(line)
+    if not m:
+        return
+    step_id, rest = m.group(1), m.group(2)
+    step = steps.get(step_id)
+    if step is None:
+        step = {"id": step_id, "title": "", "status": "running", "duration": None, "error": None}
+        steps[step_id] = step
+        order.append(step_id)
+    if rest == "CACHED":
+        step["status"] = "cached"
+    else:
+        dm = _STEP_DONE_RE.match(rest)
+        if dm is not None:
+            step["status"] = "done"
+            step["duration"] = float(dm.group(1))
+        elif rest.startswith("ERROR"):
+            step["status"] = "error"
+            step["error"] = rest[len("ERROR"):].strip(": ")
+        elif rest.startswith("[") and not step["title"]:
+            step["title"] = rest
+
 
 def _now_ms() -> int:
     return int(time.time() * 1000)
@@ -82,6 +150,8 @@ class MilocoController:
         self._build_task: Optional[asyncio.Task] = None
         self._build_log: List[str] = []
         self._build_error: Optional[str] = None
+        self._build_steps: Dict[str, Dict[str, Any]] = {}
+        self._build_order: List[str] = []
 
     # ------------------------------------------------------------ docker probe
     async def docker_available(self) -> bool:
@@ -240,15 +310,28 @@ class MilocoController:
         return str(server.get("token")) if isinstance(server, dict) and server.get("token") else ""
 
     # ------------------------------------------------------------- image build
-    async def build_image(self) -> None:
-        """Build the Miloco image from the bundled Dockerfile (idempotent)."""
+    async def build_image(
+        self, pip_mirror: str = "default", apt_mirror: str = "default",
+        registry_mirror: str = "default",
+    ) -> None:
+        """Build the Miloco image from the bundled Dockerfile (idempotent).
+
+        Args:
+            pip_mirror: a key into PIP_MIRRORS, or any raw index URL.
+            apt_mirror: a key into APT_MIRRORS, or any raw hostname.
+            registry_mirror: a key into REGISTRY_MIRRORS, or any raw
+                registry prefix to pull the base image through.
+        """
         if self._build_task is not None and not self._build_task.done():
             return
         self._build_log = []
         self._build_error = None
-        self._build_task = asyncio.create_task(self._build_image_impl())
+        self._build_steps = {}
+        self._build_order = []
+        self._build_task = asyncio.create_task(
+            self._build_image_impl(pip_mirror, apt_mirror, registry_mirror))
 
-    async def _build_image_impl(self) -> None:
+    async def _build_image_impl(self, pip_mirror: str, apt_mirror: str, registry_mirror: str) -> None:
         docker = _docker_bin()
         if not docker:
             self._build_error = "未检测到 docker，请先安装 Docker。"
@@ -257,16 +340,30 @@ class MilocoController:
         if not dockerfile.exists():
             self._build_error = f"未找到 Dockerfile：{dockerfile}"
             return
-        cmd = [docker, "build", "-t", IMAGE_NAME, "-f", str(dockerfile), str(_DOCKERFILE_DIR)]
+
+        registry_prefix = _resolve_mirror(registry_mirror, REGISTRY_MIRRORS)
+        base_image = f"{registry_prefix}/library/{_BASE_IMAGE}" if registry_prefix else _BASE_IMAGE
+        cmd = [
+            docker, "build", "--progress=plain",
+            "-t", IMAGE_NAME, "-f", str(dockerfile),
+            "--build-arg", f"BASE_IMAGE={base_image}",
+            "--build-arg", f"PIP_INDEX_URL={_resolve_mirror(pip_mirror, PIP_MIRRORS)}",
+            "--build-arg", f"APT_MIRROR={_resolve_mirror(apt_mirror, APT_MIRRORS)}",
+            str(_DOCKERFILE_DIR),
+        ]
         self._build_log.append("$ " + " ".join(cmd))
 
         def _call() -> int:
-            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            env = {**os.environ, "DOCKER_BUILDKIT": "1"}
+            proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
             assert proc.stdout is not None
             for line in proc.stdout:
-                self._build_log.append(line.rstrip())
+                line = line.rstrip()
+                self._build_log.append(line)
                 if len(self._build_log) > 2000:
                     del self._build_log[:1000]
+                _parse_build_line(self._build_steps, self._build_order, line)
             return proc.wait()
 
         try:
@@ -283,6 +380,7 @@ class MilocoController:
             "building": running,
             "error": self._build_error,
             "log_tail": self._build_log[-200:],
+            "steps": [self._build_steps[i] for i in self._build_order],
         }
 
     # ------------------------------------------------------------ run / stop
