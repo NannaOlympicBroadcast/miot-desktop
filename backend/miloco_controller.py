@@ -30,6 +30,7 @@ import asyncio
 import json
 import logging
 import os
+import secrets
 import shutil
 import sqlite3
 import subprocess
@@ -192,6 +193,43 @@ class MilocoController:
         _LOGGER.info("seeded Mi OAuth token into %s", db_path)
         return True
 
+    def _seed_agent_webhook(self) -> bool:
+        """Point Miloco's own ``agent.webhook_url`` / ``agent.auth_bearer`` at
+        this backend's embedded SSR agent, so Miloco's perception/rule engine
+        can drive it directly instead of needing a separate OpenClaw install.
+
+        ``ssr.integrations.miloco.start_bus_bridge`` already listens on
+        Miloco's own default agent-webhook port (``18789``) with no config
+        needed for the common single-host case; this makes the pairing
+        explicit and shares a real bearer token between the two sides.
+        Best-effort and order-sensitive: the token only takes effect for a
+        webhook server (re)bound *after* this runs (a restart, not a
+        hot-reload) — harmless either way since a fresh install's token
+        starts unset (open) until the first successful pairing.
+        """
+        config_path = MILOCO_HOME / "config.json"
+        try:
+            data = json.loads(config_path.read_text("utf-8")) if config_path.exists() else {}
+            if not isinstance(data, dict):
+                data = {}
+        except (OSError, json.JSONDecodeError):
+            data = {}
+        agent_cfg = data.get("agent") if isinstance(data.get("agent"), dict) else {}
+        token = agent_cfg.get("auth_bearer") or secrets.token_hex(16)
+        port = os.environ.get("MILOCO_AGENT_WEBHOOK_PORT", "18789")
+        agent_cfg["webhook_url"] = f"http://127.0.0.1:{port}/miloco/webhook"
+        agent_cfg["auth_bearer"] = token
+        data["agent"] = agent_cfg
+        try:
+            MILOCO_HOME.mkdir(parents=True, exist_ok=True)
+            config_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), "utf-8")
+        except OSError as e:
+            _LOGGER.warning("failed to seed agent webhook config: %s", e)
+            return False
+        os.environ["MILOCO_AGENT_AUTH_BEARER"] = token
+        os.environ.setdefault("MILOCO_AGENT_WEBHOOK_PORT", port)
+        return True
+
     def server_token(self) -> str:
         """Miloco's auto-generated web/API bearer token from its config.json."""
         try:
@@ -255,8 +293,11 @@ class MilocoController:
         if not await self.image_exists():
             raise RuntimeError(f"镜像 {IMAGE_NAME} 不存在，请先点击「构建镜像」。")
 
-        # Seed our Mi credentials before first boot so Miloco comes up bound.
+        # Seed our Mi credentials before first boot so Miloco comes up bound,
+        # and point Miloco's agent webhook at this backend's embedded SSR
+        # agent so perception/rule automation reaches it directly.
         seeded = self._seed_credentials()
+        self._seed_agent_webhook()
 
         state = await self._container_state()
         if state == "running":

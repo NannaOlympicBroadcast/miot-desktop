@@ -26,12 +26,14 @@ for pkg in [
     'aiohttp', 'aiocache', 'aiofiles',
     'zeroconf', 'cryptography', 'yaml', 'psutil',
     'miservice', 'httpx',
-    # SSR agent + its runtime deps, so the frozen backend embeds the "SSR 助手"
-    # driver. These are optional: a build without ssr-agent installed simply
-    # skips them (collect_all raises, we log and continue), and the SSR tab
-    # degrades gracefully at runtime.
+    # SSR minimal runtime + its runtime deps, so the frozen backend embeds the
+    # "SSR 助手" driver. These are optional: a build without ssr-agent-minimal
+    # installed simply skips them (collect_all raises, we log and continue),
+    # and the SSR tab degrades gracefully at runtime. No CLI/TUI deps here
+    # (rich/pyfiglet/prompt_toolkit) — the minimal runtime is SDK-only, which
+    # is the whole point of the swap from the old ssr-agent.
     'ssr', 'google.adk', 'google.genai', 'model2vec', 'numpy', 'tavily',
-    'websockets', 'dotenv', 'rich', 'pyfiglet', 'prompt_toolkit',
+    'websockets', 'dotenv',
 ]:
     try:
         d, b, h = collect_all(pkg)
