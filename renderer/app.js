@@ -779,7 +779,53 @@ async function xiaomiSpeak() {
 // ===========================================================================
 // Miloco (Mi Home perceptive gateway) — Docker controller + web preview
 // ===========================================================================
-let MILOCO = { status: null, buildPoll: null, statusPoll: null };
+const MILOCO_MIRROR_PRESETS = {
+  pip: [
+    { value: 'default', label: '官方 (pypi.org)' },
+    { value: 'tsinghua', label: '清华' },
+    { value: 'aliyun', label: '阿里云' },
+    { value: 'ustc', label: '中科大' },
+    { value: 'tencent', label: '腾讯云' },
+    { value: 'custom', label: '自定义…' },
+  ],
+  apt: [
+    { value: 'default', label: '官方 (deb.debian.org)' },
+    { value: 'aliyun', label: '阿里云' },
+    { value: 'tsinghua', label: '清华' },
+    { value: 'ustc', label: '中科大' },
+    { value: 'tencent', label: '腾讯云' },
+    { value: 'custom', label: '自定义…' },
+  ],
+  registry: [
+    { value: 'default', label: '官方 (docker.io)' },
+    { value: 'daocloud', label: 'DaoCloud' },
+    { value: 'custom', label: '自定义…' },
+  ],
+};
+
+function loadMirrorPrefs() {
+  try {
+    const raw = localStorage.getItem('miloco_mirror_prefs');
+    if (raw) return JSON.parse(raw);
+  } catch (e) { /* ignore corrupt/unavailable storage */ }
+  return { pip: 'default', apt: 'default', registry: 'default', pipCustom: '', aptCustom: '', registryCustom: '' };
+}
+
+function saveMirrorPrefs(prefs) {
+  try { localStorage.setItem('miloco_mirror_prefs', JSON.stringify(prefs)); } catch (e) { /* ignore */ }
+}
+
+function resolvedMirror(kind) {
+  const v = MILOCO.mirrors[kind];
+  if (v === 'custom') return (MILOCO.mirrors[kind + 'Custom'] || '').trim() || 'default';
+  return v || 'default';
+}
+
+let MILOCO = {
+  status: null, buildPoll: null, statusPoll: null,
+  building: false, showMirrors: false, mirrors: loadMirrorPrefs(),
+  lastBuildSteps: [], lastBuildLog: [],
+};
 
 async function loadMiloco() {
   const wrap = $('#miloco-wrap');
@@ -834,7 +880,9 @@ function renderMiloco() {
       </div>
       <div class="miloco-actions">
         ${!s.image_exists
-          ? `<button class="btn primary" id="ml-build">构建镜像</button>`
+          ? `<button class="btn primary" id="ml-build" ${MILOCO.building ? 'disabled' : ''}>
+               ${MILOCO.building ? '构建中…' : '构建镜像'}</button>
+             <button class="btn" id="ml-mirrors-toggle">${MILOCO.showMirrors ? '收起镜像源' : '镜像源设置'}</button>`
           : ''}
         ${s.image_exists && !s.running
           ? `<button class="btn primary" id="ml-start">启动 Miloco</button>` : ''}
@@ -844,6 +892,14 @@ function renderMiloco() {
         <button class="btn" id="ml-logs">查看日志</button>
       </div>
     </div>`;
+
+  const mirrors = !s.image_exists && MILOCO.showMirrors ? `
+    <div class="miloco-mirrors">
+      ${renderMirrorRow('pip', 'PyPI 镜像')}
+      ${renderMirrorRow('apt', 'APT 镜像')}
+      ${renderMirrorRow('registry', 'Docker 镜像仓库')}
+      <div class="hint">仅影响下一次构建；选择会保存在本机，下次自动沿用。</div>
+    </div>` : '';
 
   const credNote = s.has_credentials
     ? `<div class="hint">✓ 已检测到本机米家登录凭据，启动时会自动注入给 Miloco（无需在 Miloco 里重新绑定账号）。</div>`
@@ -863,7 +919,13 @@ function renderMiloco() {
     body = `<div class="miloco-preview placeholder">
       <div class="placeholder-icon">📦</div>
       <p>尚未构建 Miloco 镜像。点击「构建镜像」从官方源构建（首次较慢）。</p>
-      <pre class="xm-code" id="ml-build-log" style="display:none;max-height:280px;overflow:auto;text-align:left;width:100%"></pre>
+      <div class="build-progress" id="ml-build-progress" style="display:${MILOCO.building ? 'block' : 'none'}">
+        <div class="build-steps" id="ml-build-steps"></div>
+        <details class="build-log-details">
+          <summary>原始日志</summary>
+          <pre class="xm-code" id="ml-build-log" style="max-height:220px;overflow:auto"></pre>
+        </details>
+      </div>
     </div>`;
   } else {
     body = `<div class="miloco-preview placeholder">
@@ -872,10 +934,46 @@ function renderMiloco() {
     </div>`;
   }
 
-  wrap.innerHTML = `<div class="miloco-panel">${controls}${credNote}${body}</div>`;
+  wrap.innerHTML = `<div class="miloco-panel">${controls}${mirrors}${credNote}${body}</div>`;
   bindMilocoEvents();
-  // If a build is in progress, resume streaming its log.
-  if (MILOCO.buildPoll) pollMilocoBuild();
+  // If a build is in progress, resume streaming it — repaint what we already
+  // know immediately (no flicker while waiting for the next poll tick) and
+  // keep the interval that feeds it running.
+  if (MILOCO.building) {
+    renderBuildSteps(MILOCO.lastBuildSteps);
+    const logBox = $('#ml-build-log');
+    if (logBox) logBox.textContent = MILOCO.lastBuildLog.join('\n');
+    pollMilocoBuild();
+  }
+}
+
+function renderMirrorRow(kind, label) {
+  const opts = MILOCO_MIRROR_PRESETS[kind].map((o) =>
+    `<option value="${o.value}" ${MILOCO.mirrors[kind] === o.value ? 'selected' : ''}>${escapeHtml(o.label)}</option>`
+  ).join('');
+  const showCustom = MILOCO.mirrors[kind] === 'custom';
+  return `<div class="xm-form-row">
+    <label>${label}</label>
+    <select class="ml-mirror-select" data-kind="${kind}">${opts}</select>
+    <input class="text-input ml-mirror-custom" data-kind="${kind}" style="max-width:260px;${showCustom ? '' : 'display:none'}"
+      placeholder="自定义地址" value="${escapeHtml(MILOCO.mirrors[kind + 'Custom'] || '')}" />
+  </div>`;
+}
+
+function renderBuildSteps(steps) {
+  const box = $('#ml-build-steps');
+  if (!box) return;
+  box.innerHTML = (steps || []).map((s) => {
+    const running = s.status === 'running';
+    const failed = s.status === 'error';
+    const icon = running ? '<span class="tool-spinner"></span>' : (failed ? '⚠️' : '✓');
+    const suffix = s.status === 'cached' ? 'cached' : (s.duration != null ? `${s.duration.toFixed(1)}s` : '');
+    return `<div class="tool-card build-step ${running ? 'running' : 'done'}${failed ? ' error' : ''}">
+      <div class="tool-head">${icon} <span class="tool-name">${escapeHtml(s.title || ('#' + s.id))}</span>${running ? '…' : ' ' + suffix}</div>
+      ${s.error ? `<div class="tool-result">${escapeHtml(s.error)}</div>` : ''}
+    </div>`;
+  }).join('');
+  box.scrollTop = box.scrollHeight;
 }
 
 function bindMilocoEvents() {
@@ -884,15 +982,35 @@ function bindMilocoEvents() {
   b('ml-start', milocoStart);
   b('ml-stop', milocoStop);
   b('ml-logs', milocoShowLogs);
+  b('ml-mirrors-toggle', () => { MILOCO.showMirrors = !MILOCO.showMirrors; renderMiloco(); });
   b('ml-open', () => window.miot.openExternal(MILOCO.status.preview_url));
+  $$('#miloco-wrap .ml-mirror-select').forEach((sel) => {
+    sel.addEventListener('change', () => {
+      MILOCO.mirrors[sel.dataset.kind] = sel.value;
+      saveMirrorPrefs(MILOCO.mirrors);
+      renderMiloco();
+    });
+  });
+  $$('#miloco-wrap .ml-mirror-custom').forEach((inp) => {
+    inp.addEventListener('input', () => {
+      MILOCO.mirrors[inp.dataset.kind + 'Custom'] = inp.value;
+      saveMirrorPrefs(MILOCO.mirrors);
+    });
+  });
 }
 
 async function milocoBuild() {
   try {
-    await apiPost('/api/miloco/build', {});
+    await apiPost('/api/miloco/build', {
+      pip_mirror: resolvedMirror('pip'),
+      apt_mirror: resolvedMirror('apt'),
+      registry_mirror: resolvedMirror('registry'),
+    });
     toast('开始构建镜像…', 'ok');
-    const logBox = $('#ml-build-log');
-    if (logBox) logBox.style.display = 'block';
+    MILOCO.building = true;
+    MILOCO.lastBuildSteps = [];
+    MILOCO.lastBuildLog = [];
+    renderMiloco();
     pollMilocoBuild();
   } catch (e) { toast('构建失败：' + e.message, 'err'); }
 }
@@ -902,11 +1020,15 @@ async function pollMilocoBuild() {
   MILOCO.buildPoll = setInterval(async () => {
     let st;
     try { st = await api('/api/miloco/build/status'); } catch (e) { return; }
+    MILOCO.lastBuildSteps = st.steps || [];
+    MILOCO.lastBuildLog = st.log_tail || [];
     const logBox = $('#ml-build-log');
-    if (logBox) { logBox.textContent = (st.log_tail || []).join('\n'); logBox.scrollTop = logBox.scrollHeight; }
+    if (logBox) { logBox.textContent = MILOCO.lastBuildLog.join('\n'); logBox.scrollTop = logBox.scrollHeight; }
+    renderBuildSteps(MILOCO.lastBuildSteps);
     if (!st.building) {
       clearInterval(MILOCO.buildPoll);
       MILOCO.buildPoll = null;
+      MILOCO.building = false;
       if (st.error) toast('镜像构建失败：' + st.error, 'err');
       else toast('镜像构建完成', 'ok');
       loadMiloco();

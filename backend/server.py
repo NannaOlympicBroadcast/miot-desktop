@@ -613,8 +613,20 @@ async def h_miloco_status(request: web.Request) -> web.Response:
 
 
 async def h_miloco_build(request: web.Request) -> web.Response:
+    """Body (all optional): {pip_mirror, apt_mirror, registry_mirror} — each
+    either a preset name (see MilocoController's PIP_MIRRORS/APT_MIRRORS/
+    REGISTRY_MIRRORS) or a raw URL/host/prefix; "default" (or omitted) keeps
+    the corresponding Dockerfile ARG at its upstream default."""
     try:
-        await MILOCO.build_image()
+        body = await request.json()
+    except (json.JSONDecodeError, TypeError):
+        body = {}
+    try:
+        await MILOCO.build_image(
+            pip_mirror=str(body.get("pip_mirror") or "default"),
+            apt_mirror=str(body.get("apt_mirror") or "default"),
+            registry_mirror=str(body.get("registry_mirror") or "default"),
+        )
         return _json(MILOCO.build_status())
     except Exception as err:  # pylint: disable=broad-except
         return _err(str(err))
