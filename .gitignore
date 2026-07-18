@@ -9,5 +9,8 @@ dist-backend/
 build-backend/
 *.spec.bak
 
+# SSR agent runtime state (created when chatting with the bundled agent)
+.ssr/
+
 # misc
 _snap*.png

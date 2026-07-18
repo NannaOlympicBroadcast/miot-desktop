@@ -109,6 +109,8 @@ from miot.types import (  # noqa: E402
 )
 
 import xiaomi_asr_bridge  # noqa: E402
+import miloco_controller  # noqa: E402
+import ssr_agent_bridge  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -227,6 +229,12 @@ _AUTH: Dict[str, Any] = {"client": None, "uuid": None, "state": None}
 # XiaoAI ASR/TTS bridge (separate Mi passport credential — see xiaomi_asr_bridge.py).
 ASR = xiaomi_asr_bridge.XiaomiAsrBridge()
 
+# Miloco Docker controller (Mi Home perceptive gateway — see miloco_controller.py).
+MILOCO = miloco_controller.MilocoController()
+
+# SSR agent bridge (chat assistant + Miloco→bus — see ssr_agent_bridge.py).
+AGENT = ssr_agent_bridge.SSRAgentBridge()
+
 
 def _parse_code_state(body: Dict[str, Any], fallback_state: Optional[str] = None) -> tuple:
     """Extract (code, state) from a request body.
@@ -293,7 +301,6 @@ async def h_health(request: web.Request) -> web.Response:
     return _json({
         "ready": BE.ready,
         "error": BE.error,
-        "camera_native_available": CAMERA_NATIVE_AVAILABLE,
         "cloud_server": CLOUD_SERVER,
         "cache_path": CACHE_PATH,
         "platform": platform.system(),
@@ -419,20 +426,6 @@ async def h_devices(request: web.Request) -> web.Response:
         return _client_err(err)
 
 
-async def h_cameras(request: web.Request) -> web.Response:
-    try:
-        cameras = await BE.client.get_cameras_async()
-        out = []
-        for did, cam in cameras.items():
-            c = cam.model_dump()
-            c["did"] = did
-            c["camera_status"] = int(cam.camera_status)
-            out.append(c)
-        return _json(out)
-    except Exception as err:  # pylint: disable=broad-except
-        return _client_err(err)
-
-
 async def h_spec(request: web.Request) -> web.Response:
     did = request.query.get("did")
     urn = request.query.get("urn")
@@ -495,70 +488,6 @@ async def h_action(request: web.Request) -> web.Response:
         return _json({"result": result})
     except Exception as err:  # pylint: disable=broad-except
         return _client_err(err)
-
-
-# ---------------------------------------------------------------------------
-# Camera live stream (WebSocket, JPEG frames)
-# ---------------------------------------------------------------------------
-async def ws_camera(request: web.Request) -> web.WebSocketResponse:
-    ws = web.WebSocketResponse()
-    await ws.prepare(request)
-    did = request.query.get("did", "")
-    pin = request.query.get("pin") or None
-
-    if not CAMERA_NATIVE_AVAILABLE:
-        await ws.send_json({
-            "type": "error",
-            "message": "当前平台缺少摄像头 P2P 原生库 (miot_camera_lite)，无法解码实时画面。设备控制功能仍可正常使用。",
-        })
-        await ws.close()
-        return ws
-
-    cameras = await BE.client.get_cameras_async()
-    cam_info = cameras.get(did)
-    if not cam_info:
-        await ws.send_json({"type": "error", "message": f"camera not found: {did}"})
-        await ws.close()
-        return ws
-
-    loop = asyncio.get_event_loop()
-    instance = None
-
-    async def on_jpg(_did: str, data: bytes, ts: int, channel: int) -> None:
-        if not ws.closed:
-            try:
-                await ws.send_bytes(bytes(data))
-            except Exception:  # pylint: disable=broad-except
-                pass
-
-    async def on_status(_did: str, status) -> None:
-        if not ws.closed:
-            try:
-                await ws.send_json({"type": "status", "status": int(status)})
-            except Exception:  # pylint: disable=broad-except
-                pass
-
-    try:
-        instance = await BE.client.create_camera_instance_async(cam_info)
-        await instance.register_decode_jpg_async(callback=on_jpg, channel=0)
-        await instance.register_status_changed_async(callback=on_status)
-        await instance.start_async(pin_code=pin, enable_reconnect=True)
-        await ws.send_json({"type": "started"})
-        async for msg in ws:
-            if msg.type in (WSMsgType.CLOSE, WSMsgType.ERROR):
-                break
-    except Exception as err:  # pylint: disable=broad-except
-        if not ws.closed:
-            await ws.send_json({"type": "error", "message": str(err)})
-    finally:
-        try:
-            if instance:
-                await BE.client.camera_client.destroy_camera_async(did)
-        except Exception:  # pylint: disable=broad-except
-            pass
-        if not ws.closed:
-            await ws.close()
-    return ws
 
 
 # ---------------------------------------------------------------------------
@@ -673,6 +602,135 @@ async def h_xiaomi_speak(request: web.Request) -> web.Response:
         return _err(str(err))
 
 
+# ---------------------------------------------------------------------------
+# Miloco Docker controller handlers
+# ---------------------------------------------------------------------------
+async def h_miloco_status(request: web.Request) -> web.Response:
+    try:
+        return _json(await MILOCO.status())
+    except Exception as err:  # pylint: disable=broad-except
+        return _err(str(err))
+
+
+async def h_miloco_build(request: web.Request) -> web.Response:
+    try:
+        await MILOCO.build_image()
+        return _json(MILOCO.build_status())
+    except Exception as err:  # pylint: disable=broad-except
+        return _err(str(err))
+
+
+async def h_miloco_build_status(request: web.Request) -> web.Response:
+    return _json(MILOCO.build_status())
+
+
+async def h_miloco_start(request: web.Request) -> web.Response:
+    try:
+        return _json(await MILOCO.start())
+    except Exception as err:  # pylint: disable=broad-except
+        return _err(str(err))
+
+
+async def h_miloco_stop(request: web.Request) -> web.Response:
+    try:
+        return _json(await MILOCO.stop())
+    except Exception as err:  # pylint: disable=broad-except
+        return _err(str(err))
+
+
+async def h_miloco_logs(request: web.Request) -> web.Response:
+    try:
+        tail = int(request.query.get("tail", "200"))
+        return _json({"logs": await MILOCO.logs(tail=tail)})
+    except Exception as err:  # pylint: disable=broad-except
+        return _err(str(err))
+
+
+# ---------------------------------------------------------------------------
+# SSR agent handlers (chat assistant + model config)
+# ---------------------------------------------------------------------------
+async def h_agent_status(request: web.Request) -> web.Response:
+    try:
+        return _json(AGENT.status())
+    except Exception as err:  # pylint: disable=broad-except
+        return _err(str(err))
+
+
+async def h_agent_models_get(request: web.Request) -> web.Response:
+    if not AGENT.available():
+        return _err("SSR agent 不可用", 400)
+    try:
+        return _json(AGENT.list_models())
+    except Exception as err:  # pylint: disable=broad-except
+        return _err(str(err))
+
+
+async def h_agent_models_post(request: web.Request) -> web.Response:
+    if not AGENT.available():
+        return _err("SSR agent 不可用", 400)
+    try:
+        body = await request.json()
+        return _json(AGENT.set_model(body))
+    except Exception as err:  # pylint: disable=broad-except
+        return _err(str(err))
+
+
+async def ws_agent(request: web.Request) -> web.WebSocketResponse:
+    """Chat WebSocket. Client sends {type:'chat', text, attachments:[…]}; the
+    server streams the agent's live events and a final {type:'done', reply}."""
+    ws = web.WebSocketResponse(max_msg_size=64 * 1024 * 1024)
+    await ws.prepare(request)
+    loop = asyncio.get_event_loop()
+
+    if not AGENT.available():
+        await ws.send_json({"type": "error", "message": AGENT.status().get("message", "SSR agent 不可用")})
+        await ws.close()
+        return ws
+
+    def emit(event: dict) -> None:
+        # Called from the worker thread running the (blocking) turn.
+        try:
+            asyncio.run_coroutine_threadsafe(ws.send_json(_jsonable(event)), loop)
+        except Exception:  # pylint: disable=broad-except
+            pass
+
+    async for msg in ws:
+        if msg.type in (WSMsgType.CLOSE, WSMsgType.ERROR):
+            break
+        if msg.type != WSMsgType.TEXT:
+            continue
+        try:
+            data = json.loads(msg.data)
+        except (json.JSONDecodeError, TypeError):
+            await ws.send_json({"type": "error", "message": "invalid json"})
+            continue
+        if data.get("type") != "chat":
+            continue
+        text = data.get("text") or ""
+        attachments = data.get("attachments") or []
+        try:
+            reply = await loop.run_in_executor(None, AGENT.run_turn, text, attachments, emit)
+            await ws.send_json({"type": "done", "reply": reply})
+        except Exception as err:  # pylint: disable=broad-except
+            _LOGGER.exception("agent turn failed")
+            await ws.send_json({"type": "error", "message": str(err)})
+    return ws
+
+
+def _jsonable(event: dict) -> dict:
+    """Drop/encode non-JSON-serialisable fields (e.g. raw bytes) from an event."""
+    out = {}
+    for k, v in event.items():
+        if isinstance(v, (bytes, bytearray)):
+            continue
+        try:
+            json.dumps(v, default=str)
+            out[k] = v
+        except (TypeError, ValueError):
+            out[k] = str(v)
+    return out
+
+
 async def on_startup(app: web.Application) -> None:
     try:
         await BE.init()
@@ -695,13 +753,11 @@ def build_app() -> web.Application:
     app.router.add_get("/api/user", h_user)
     app.router.add_get("/api/homes", h_homes)
     app.router.add_get("/api/devices", h_devices)
-    app.router.add_get("/api/cameras", h_cameras)
     app.router.add_get("/api/spec", h_spec)
     app.router.add_post("/api/prop/get", h_prop_get)
     app.router.add_post("/api/props/get", h_props_get)
     app.router.add_post("/api/prop/set", h_prop_set)
     app.router.add_post("/api/action", h_action)
-    app.router.add_get("/ws/camera", ws_camera)
     app.router.add_get("/api/xiaomi/status", h_xiaomi_status)
     app.router.add_get("/api/xiaomi/token", h_xiaomi_token_info)
     app.router.add_post("/api/xiaomi/token", h_xiaomi_token_post)
@@ -713,6 +769,16 @@ def build_app() -> web.Application:
     app.router.add_post("/api/xiaomi/bridge/stop", h_xiaomi_bridge_stop)
     app.router.add_get("/api/xiaomi/bridge/status", h_xiaomi_bridge_status)
     app.router.add_post("/api/xiaomi/speak", h_xiaomi_speak)
+    app.router.add_get("/api/miloco/status", h_miloco_status)
+    app.router.add_post("/api/miloco/build", h_miloco_build)
+    app.router.add_get("/api/miloco/build/status", h_miloco_build_status)
+    app.router.add_post("/api/miloco/start", h_miloco_start)
+    app.router.add_post("/api/miloco/stop", h_miloco_stop)
+    app.router.add_get("/api/miloco/logs", h_miloco_logs)
+    app.router.add_get("/api/agent/status", h_agent_status)
+    app.router.add_get("/api/agent/models", h_agent_models_get)
+    app.router.add_post("/api/agent/models", h_agent_models_post)
+    app.router.add_get("/ws/agent", ws_agent)
     app.on_startup.append(on_startup)
     app.on_cleanup.append(on_cleanup)
     return app

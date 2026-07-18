@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta http-equiv="Content-Security-Policy"
-        content="default-src 'self'; connect-src http://127.0.0.1:* ws://127.0.0.1:*; img-src 'self' https: data: blob:; style-src 'self' 'unsafe-inline';" />
+        content="default-src 'self'; connect-src http://127.0.0.1:* ws://127.0.0.1:*; img-src 'self' https: data: blob:; style-src 'self' 'unsafe-inline'; frame-src http://127.0.0.1:*;" />
   <title>米家桌面端</title>
   <link rel="stylesheet" href="styles.css" />
 </head>
@@ -15,7 +15,8 @@
     </div>
     <nav class="tabs">
       <button class="tab active" data-tab="devices">设备控制</button>
-      <button class="tab" data-tab="cameras">摄像头</button>
+      <button class="tab" data-tab="miloco">Miloco</button>
+      <button class="tab" data-tab="agent">SSR 助手</button>
       <button class="tab" data-tab="xiaomi">小爱音箱</button>
     </nav>
     <div class="topbar-right">
@@ -65,11 +66,17 @@
       </div>
     </section>
 
-    <!-- ===================== CAMERAS ===================== -->
-    <section id="tab-cameras" class="tab-panel">
-      <div class="camera-wrap">
-        <div id="camera-banner" class="banner hidden"></div>
-        <div id="camera-grid" class="camera-grid"></div>
+    <!-- ===================== MILOCO ===================== -->
+    <section id="tab-miloco" class="tab-panel">
+      <div class="miloco-wrap" id="miloco-wrap">
+        <div class="loading"><span class="spinner"></span> 加载中…</div>
+      </div>
+    </section>
+
+    <!-- ===================== SSR AGENT ===================== -->
+    <section id="tab-agent" class="tab-panel">
+      <div class="agent-wrap" id="agent-wrap">
+        <div class="loading"><span class="spinner"></span> 加载中…</div>
       </div>
     </section>
 

@@ -67,7 +67,8 @@ $$('.tab').forEach((tab) => {
     $$('.tab-panel').forEach((p) => p.classList.remove('active'));
     tab.classList.add('active');
     $('#tab-' + tab.dataset.tab).classList.add('active');
-    if (tab.dataset.tab === 'cameras') loadCameras();
+    if (tab.dataset.tab === 'miloco') loadMiloco();
+    if (tab.dataset.tab === 'agent') loadAgent();
     if (tab.dataset.tab === 'xiaomi') loadXiaomi();
   });
 });
@@ -77,8 +78,10 @@ $('#refresh-btn').addEventListener('click', () => {
   if (active === 'devices') {
     loadDevices();
     if (CURRENT_DID) selectDevice(CURRENT_DID);
-  } else if (active === 'cameras') {
-    loadCameras();
+  } else if (active === 'miloco') {
+    loadMiloco();
+  } else if (active === 'agent') {
+    loadAgent();
   } else if (active === 'xiaomi') {
     loadXiaomi();
   }
@@ -488,101 +491,6 @@ async function runAction(did, a, key) {
 }
 
 // ===========================================================================
-// Cameras
-// ===========================================================================
-const camStreams = {}; // did -> { ws, url }
-
-async function loadCameras() {
-  const banner = $('#camera-banner');
-  const grid = $('#camera-grid');
-  if (!HEALTH.camera_native_available) {
-    banner.classList.remove('hidden');
-    banner.innerHTML = '⚠️ 当前平台未检测到摄像头 P2P 原生库 <code>miot_camera_lite</code>，' +
-      '因此<strong>无法解码实时视频画面</strong>。摄像头设备依然会列出，并可在「设备控制」中通过 SPEC 进行控制。' +
-      '若获得对应平台的原生库，将其放入 miot_kit/miot/libs/&lt;平台&gt; 后即可启用实时画面。';
-  } else {
-    banner.classList.add('hidden');
-  }
-  grid.innerHTML = '<div class="loading"><span class="spinner"></span> 加载摄像头…</div>';
-  let cams;
-  try {
-    cams = await api('/api/cameras');
-  } catch (e) {
-    if (e.authRequired) { handleAuthExpired(e.message); return; }
-    grid.innerHTML = `<div class="loading" style="color:var(--red)">${escapeHtml(e.message)}</div>`;
-    return;
-  }
-  if (!cams.length) {
-    grid.innerHTML = '<div class="placeholder" style="grid-column:1/-1"><div class="placeholder-icon">📷</div><p>当前账号下未发现米家摄像头设备。</p></div>';
-    return;
-  }
-  grid.innerHTML = cams.map((c) => {
-    const can = HEALTH.camera_native_available;
-    return `<div class="camera-card" data-did="${escapeHtml(c.did)}">
-      <div class="camera-video" id="vid_${escapeHtml(c.did)}">
-        <span class="cam-overlay">${can ? '点击「播放」开始实时画面' : '实时画面不可用（缺少原生库）'}</span>
-      </div>
-      <div class="camera-foot">
-        <span class="cam-name">${escapeHtml(c.name)}</span>
-        <button class="btn small primary" data-play="${escapeHtml(c.did)}" ${can ? '' : 'disabled'}>播放</button>
-        <button class="btn small" data-stop="${escapeHtml(c.did)}" disabled>停止</button>
-      </div>
-    </div>`;
-  }).join('');
-  grid.querySelectorAll('[data-play]').forEach((b) =>
-    b.addEventListener('click', () => startCamera(b.dataset.play)));
-  grid.querySelectorAll('[data-stop]').forEach((b) =>
-    b.addEventListener('click', () => stopCamera(b.dataset.stop)));
-}
-
-function startCamera(did) {
-  stopCamera(did);
-  const wsUrl = BASE.replace('http', 'ws') + '/ws/camera?did=' + encodeURIComponent(did);
-  const ws = new WebSocket(wsUrl);
-  ws.binaryType = 'arraybuffer';
-  const vid = $('#vid_' + did);
-  vid.innerHTML = '<span class="cam-overlay"><span class="spinner"></span> 连接摄像头…</span>';
-  $(`[data-play="${did}"]`).disabled = true;
-  $(`[data-stop="${did}"]`).disabled = false;
-
-  let imgEl = null;
-  let lastUrl = null;
-  ws.onmessage = (ev) => {
-    if (typeof ev.data === 'string') {
-      const msg = JSON.parse(ev.data);
-      if (msg.type === 'error') { vid.innerHTML = `<span class="cam-overlay">${escapeHtml(msg.message)}</span>`; toast(msg.message, 'err'); }
-      else if (msg.type === 'started') vid.innerHTML = '<span class="cam-overlay"><span class="spinner"></span> 等待画面…</span>';
-      return;
-    }
-    // binary JPEG frame
-    if (!imgEl) { vid.innerHTML = ''; imgEl = document.createElement('img'); vid.appendChild(imgEl); }
-    const blob = new Blob([ev.data], { type: 'image/jpeg' });
-    const url = URL.createObjectURL(blob);
-    imgEl.src = url;
-    if (lastUrl) URL.revokeObjectURL(lastUrl);
-    lastUrl = url;
-  };
-  ws.onclose = () => {
-    $(`[data-play="${did}"]`).disabled = !HEALTH.camera_native_available;
-    $(`[data-stop="${did}"]`).disabled = true;
-  };
-  ws.onerror = () => toast('摄像头连接出错', 'err');
-  camStreams[did] = { ws };
-}
-
-function stopCamera(did) {
-  const s = camStreams[did];
-  if (s && s.ws) { try { s.ws.close(); } catch (e) {} }
-  delete camStreams[did];
-  const vid = $('#vid_' + did);
-  if (vid) vid.innerHTML = '<span class="cam-overlay">已停止</span>';
-}
-
-window.addEventListener('beforeunload', () => {
-  Object.keys(camStreams).forEach(stopCamera);
-});
-
-// ===========================================================================
 // XiaoAI (小爱音箱) ASR/TTS bridge
 //
 // A *different* credential than the OAuth2 login above (see
@@ -866,6 +774,391 @@ async function xiaomiSpeak() {
   } finally {
     btn.disabled = false;
   }
+}
+
+// ===========================================================================
+// Miloco (Mi Home perceptive gateway) — Docker controller + web preview
+// ===========================================================================
+let MILOCO = { status: null, buildPoll: null, statusPoll: null };
+
+async function loadMiloco() {
+  const wrap = $('#miloco-wrap');
+  try {
+    MILOCO.status = await api('/api/miloco/status');
+  } catch (e) {
+    wrap.innerHTML = `<div class="loading" style="color:var(--red)">加载失败：${escapeHtml(e.message)}</div>`;
+    return;
+  }
+  renderMiloco();
+  // If it's running + healthy, keep the preview fresh; otherwise poll state.
+  clearInterval(MILOCO.statusPoll);
+  MILOCO.statusPoll = setInterval(refreshMilocoStatus, 4000);
+}
+
+async function refreshMilocoStatus() {
+  // Only poll while the Miloco tab is active.
+  if ($('.tab.active').dataset.tab !== 'miloco') { clearInterval(MILOCO.statusPoll); return; }
+  try {
+    const next = await api('/api/miloco/status');
+    const changed = JSON.stringify(next) !== JSON.stringify(MILOCO.status);
+    MILOCO.status = next;
+    if (changed) renderMiloco();
+  } catch (e) { /* ignore transient */ }
+}
+
+function renderMiloco() {
+  const s = MILOCO.status;
+  const wrap = $('#miloco-wrap');
+
+  if (!s.docker_available) {
+    wrap.innerHTML = `
+      <div class="miloco-panel">
+        <div class="banner">未检测到可用的 Docker。Miloco 需要通过 Docker 以 <code>--network host</code> 方式运行。
+          请安装并启动 Docker Desktop / Docker Engine 后重试。</div>
+        <p class="login-msg">Miloco 是小米官方的「感知家庭」网关
+          (<code>github.com/XiaoMi/xiaomi-miloco</code>)，运行后本应用会自动把当前登录的米家凭据注入给
+          Miloco，无需重新绑定账号。</p>
+      </div>`;
+    return;
+  }
+
+  const stateLabel = s.running
+    ? (s.healthy ? '<span style="color:var(--green)">运行中 · 健康</span>' : '<span style="color:var(--primary)">运行中 · 启动中…</span>')
+    : (s.container_state ? `已停止（${escapeHtml(s.container_state)}）` : '未运行');
+
+  const controls = `
+    <div class="miloco-toolbar">
+      <div class="miloco-state">
+        <span class="dev-online ${s.running && s.healthy ? 'on' : 'off'}"></span>
+        <span>Miloco 状态：${stateLabel}</span>
+      </div>
+      <div class="miloco-actions">
+        ${!s.image_exists
+          ? `<button class="btn primary" id="ml-build">构建镜像</button>`
+          : ''}
+        ${s.image_exists && !s.running
+          ? `<button class="btn primary" id="ml-start">启动 Miloco</button>` : ''}
+        ${s.running
+          ? `<button class="btn" id="ml-stop">停止</button>
+             <button class="btn" id="ml-open">在浏览器打开</button>` : ''}
+        <button class="btn" id="ml-logs">查看日志</button>
+      </div>
+    </div>`;
+
+  const credNote = s.has_credentials
+    ? `<div class="hint">✓ 已检测到本机米家登录凭据，启动时会自动注入给 Miloco（无需在 Miloco 里重新绑定账号）。</div>`
+    : `<div class="hint" style="color:var(--red)">⚠ 未检测到米家登录凭据。请先在「设备控制」标签完成小米账号登录，再启动 Miloco。</div>`;
+
+  let body;
+  if (s.running && s.healthy && s.has_server_token) {
+    body = `<div class="miloco-preview">
+      <webview id="ml-webview" src="${escapeHtml(s.preview_url)}" style="width:100%;height:100%"></webview>
+    </div>`;
+  } else if (s.running) {
+    body = `<div class="miloco-preview placeholder">
+      <div class="placeholder-icon">🏠</div>
+      <p>Miloco 正在启动…（等待 <code>${escapeHtml(s.url)}/health</code> 就绪）</p>
+    </div>`;
+  } else if (!s.image_exists) {
+    body = `<div class="miloco-preview placeholder">
+      <div class="placeholder-icon">📦</div>
+      <p>尚未构建 Miloco 镜像。点击「构建镜像」从官方源构建（首次较慢）。</p>
+      <pre class="xm-code" id="ml-build-log" style="display:none;max-height:280px;overflow:auto;text-align:left;width:100%"></pre>
+    </div>`;
+  } else {
+    body = `<div class="miloco-preview placeholder">
+      <div class="placeholder-icon">🏠</div>
+      <p>镜像已就绪。点击「启动 Miloco」以 <code>--network host</code> 方式运行，并自动注入米家凭据。</p>
+    </div>`;
+  }
+
+  wrap.innerHTML = `<div class="miloco-panel">${controls}${credNote}${body}</div>`;
+  bindMilocoEvents();
+  // If a build is in progress, resume streaming its log.
+  if (MILOCO.buildPoll) pollMilocoBuild();
+}
+
+function bindMilocoEvents() {
+  const b = (id, fn) => { const el = $('#' + id); if (el) el.addEventListener('click', fn); };
+  b('ml-build', milocoBuild);
+  b('ml-start', milocoStart);
+  b('ml-stop', milocoStop);
+  b('ml-logs', milocoShowLogs);
+  b('ml-open', () => window.miot.openExternal(MILOCO.status.preview_url));
+}
+
+async function milocoBuild() {
+  try {
+    await apiPost('/api/miloco/build', {});
+    toast('开始构建镜像…', 'ok');
+    const logBox = $('#ml-build-log');
+    if (logBox) logBox.style.display = 'block';
+    pollMilocoBuild();
+  } catch (e) { toast('构建失败：' + e.message, 'err'); }
+}
+
+async function pollMilocoBuild() {
+  clearInterval(MILOCO.buildPoll);
+  MILOCO.buildPoll = setInterval(async () => {
+    let st;
+    try { st = await api('/api/miloco/build/status'); } catch (e) { return; }
+    const logBox = $('#ml-build-log');
+    if (logBox) { logBox.textContent = (st.log_tail || []).join('\n'); logBox.scrollTop = logBox.scrollHeight; }
+    if (!st.building) {
+      clearInterval(MILOCO.buildPoll);
+      MILOCO.buildPoll = null;
+      if (st.error) toast('镜像构建失败：' + st.error, 'err');
+      else toast('镜像构建完成', 'ok');
+      loadMiloco();
+    }
+  }, 1500);
+}
+
+async function milocoStart() {
+  const btn = $('#ml-start');
+  if (btn) { btn.disabled = true; btn.textContent = '启动中…'; }
+  try {
+    const st = await apiPost('/api/miloco/start', {});
+    MILOCO.status = st;
+    toast(st.seeded_credentials ? '已启动并注入米家凭据' : '已启动 Miloco', 'ok');
+    renderMiloco();
+  } catch (e) {
+    toast('启动失败：' + e.message, 'err');
+    if (btn) { btn.disabled = false; btn.textContent = '启动 Miloco'; }
+  }
+}
+
+async function milocoStop() {
+  try {
+    MILOCO.status = await apiPost('/api/miloco/stop', {});
+    toast('已停止 Miloco', 'ok');
+    renderMiloco();
+  } catch (e) { toast('停止失败：' + e.message, 'err'); }
+}
+
+async function milocoShowLogs() {
+  try {
+    const r = await api('/api/miloco/logs?tail=200');
+    const wrap = $('#miloco-wrap');
+    const box = document.createElement('pre');
+    box.className = 'xm-code';
+    box.style.cssText = 'max-height:280px;overflow:auto;margin-top:12px';
+    box.textContent = r.logs || '（暂无日志）';
+    wrap.querySelector('.miloco-panel').appendChild(box);
+  } catch (e) { toast('读取日志失败：' + e.message, 'err'); }
+}
+
+// ===========================================================================
+// SSR agent chat (bundled agent driving Miloco + general assistant)
+// ===========================================================================
+let AGENT = { status: null, ws: null, pending: [], history: [], busy: false };
+
+async function loadAgent() {
+  const wrap = $('#agent-wrap');
+  try {
+    AGENT.status = await api('/api/agent/status');
+  } catch (e) {
+    wrap.innerHTML = `<div class="loading" style="color:var(--red)">加载失败：${escapeHtml(e.message)}</div>`;
+    return;
+  }
+  if (!AGENT.status.available) {
+    wrap.innerHTML = `
+      <div class="agent-panel">
+        <div class="banner">${escapeHtml(AGENT.status.message || 'SSR 助手不可用。')}</div>
+        <p class="login-msg">SSR 是被内置进本应用 Python 运行时的智能体，用于以自然语言驱动 Miloco 与米家设备。
+          安装后可在此聊天、配置模型、粘贴图片、上传文件，Miloco 的家庭事件也会进入 SSR 的事件总线供处理。</p>
+      </div>`;
+    return;
+  }
+  renderAgent();
+}
+
+function renderAgent() {
+  const s = AGENT.status;
+  const wrap = $('#agent-wrap');
+  wrap.innerHTML = `
+    <div class="agent-panel">
+      <div class="agent-head">
+        <div class="agent-model-info">
+          <span class="dev-online ${s.has_api_key ? 'on' : 'off'}"></span>
+          <span>模型：<strong>${escapeHtml(s.primary_model_name || '')}</strong>
+            <span class="device-sub">(${escapeHtml(s.primary_provider || '')} · ${escapeHtml(s.primary_model || '')})</span></span>
+        </div>
+        <button class="btn small" id="ag-config-btn">模型配置</button>
+      </div>
+      ${s.missing && s.missing.length
+        ? `<div class="banner">缺少 API Key：${escapeHtml(s.missing.join(', '))}。点击「模型配置」填入后即可对话。</div>` : ''}
+      <div class="agent-config hidden" id="ag-config">
+        <div class="xm-form-row"><label>模型 ID</label>
+          <input class="text-input" id="ag-id" placeholder="如 my-gemini" value="${escapeHtml(s.primary_model || '')}" /></div>
+        <div class="xm-form-row"><label>Provider</label>
+          <select id="ag-provider">
+            <option value="gemini">gemini</option>
+            <option value="anthropic">anthropic</option>
+            <option value="openai">openai</option>
+          </select></div>
+        <div class="xm-form-row"><label>模型名</label>
+          <input class="text-input" id="ag-model" placeholder="如 gemini-3.1-flash-lite" value="${escapeHtml(s.primary_model_name || '')}" /></div>
+        <div class="xm-form-row"><label>API Key</label>
+          <input class="text-input" id="ag-key" type="password" placeholder="留空则不修改" /></div>
+        <div class="xm-form-row"><label>Base URL</label>
+          <input class="text-input" id="ag-baseurl" placeholder="可选（自建/代理端点）" /></div>
+        <div class="login-actions"><button class="btn primary" id="ag-save">保存并应用</button></div>
+      </div>
+      <div class="chat-log" id="ag-log"></div>
+      <div class="chat-input">
+        <div class="chat-attachments" id="ag-attach"></div>
+        <div class="chat-row">
+          <textarea id="ag-text" rows="2" placeholder="给 SSR 助手发消息（Enter 发送，Shift+Enter 换行）…"></textarea>
+          <div class="chat-buttons">
+            <button class="btn small" id="ag-file-btn" title="上传文件">📎</button>
+            <button class="btn primary" id="ag-send">发送</button>
+          </div>
+        </div>
+        <input type="file" id="ag-file-input" multiple style="display:none" />
+      </div>
+    </div>`;
+  bindAgentEvents();
+  renderAgentHistory();
+}
+
+function bindAgentEvents() {
+  $('#ag-config-btn').addEventListener('click', () => $('#ag-config').classList.toggle('hidden'));
+  $('#ag-save').addEventListener('click', agentSaveModel);
+  $('#ag-send').addEventListener('click', agentSend);
+  $('#ag-file-btn').addEventListener('click', () => $('#ag-file-input').click());
+  $('#ag-file-input').addEventListener('change', agentPickFiles);
+  const ta = $('#ag-text');
+  ta.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); agentSend(); }
+  });
+  // Paste image support.
+  ta.addEventListener('paste', (e) => {
+    for (const item of (e.clipboardData || {}).items || []) {
+      if (item.kind === 'file' && item.type.startsWith('image/')) {
+        const file = item.getAsFile();
+        if (file) { agentAddAttachment(file, 'image'); e.preventDefault(); }
+      }
+    }
+  });
+  if (s_provider()) s_provider().value = (AGENT.status.primary_provider || 'gemini');
+}
+function s_provider() { return document.getElementById('ag-provider'); }
+
+async function agentSaveModel() {
+  const body = {
+    id: $('#ag-id').value.trim(),
+    provider: $('#ag-provider').value,
+    model: $('#ag-model').value.trim(),
+    api_key: $('#ag-key').value,
+    base_url: $('#ag-baseurl').value.trim() || null,
+    set_primary: true,
+  };
+  if (!body.id) { toast('请填写模型 ID', 'err'); return; }
+  try {
+    await apiPost('/api/agent/models', body);
+    toast('模型配置已保存', 'ok');
+    AGENT.status = await api('/api/agent/status');
+    renderAgent();
+  } catch (e) { toast('保存失败：' + e.message, 'err'); }
+}
+
+function agentPickFiles(e) {
+  for (const file of e.target.files) {
+    agentAddAttachment(file, file.type.startsWith('image/') ? 'image' : 'file');
+  }
+  e.target.value = '';
+}
+
+function agentAddAttachment(file, kind) {
+  const reader = new FileReader();
+  reader.onload = () => {
+    const b64 = String(reader.result).split(',')[1] || '';
+    AGENT.pending.push({ kind, mime: file.type, name: file.name || 'clipboard.png', data_b64: b64 });
+    renderAttachments();
+  };
+  reader.readAsDataURL(file);
+}
+
+function renderAttachments() {
+  const box = $('#ag-attach');
+  if (!box) return;
+  box.innerHTML = AGENT.pending.map((a, i) =>
+    `<span class="chip">${a.kind === 'image' ? '🖼' : '📄'} ${escapeHtml(a.name)}
+      <span class="chip-x" data-i="${i}">✕</span></span>`).join('');
+  box.querySelectorAll('.chip-x').forEach((x) =>
+    x.addEventListener('click', () => { AGENT.pending.splice(parseInt(x.dataset.i, 10), 1); renderAttachments(); }));
+}
+
+function renderAgentHistory() {
+  const log = $('#ag-log');
+  if (!log) return;
+  log.innerHTML = AGENT.history.map((m) => {
+    if (m.role === 'user') return `<div class="msg user"><div class="bubble">${escapeHtml(m.text)}</div></div>`;
+    if (m.role === 'assistant') return `<div class="msg assistant"><div class="bubble">${escapeHtml(m.text)}</div></div>`;
+    if (m.role === 'event') return `<div class="msg event">${escapeHtml(m.text)}</div>`;
+    return '';
+  }).join('');
+  log.scrollTop = log.scrollHeight;
+}
+
+function ensureAgentWs() {
+  if (AGENT.ws && AGENT.ws.readyState === WebSocket.OPEN) return Promise.resolve(AGENT.ws);
+  return new Promise((resolve, reject) => {
+    const wsUrl = BASE.replace('http', 'ws') + '/ws/agent';
+    const ws = new WebSocket(wsUrl);
+    ws.onopen = () => { AGENT.ws = ws; resolve(ws); };
+    ws.onerror = () => reject(new Error('WebSocket 连接失败'));
+    ws.onmessage = (ev) => handleAgentEvent(JSON.parse(ev.data));
+    ws.onclose = () => { AGENT.ws = null; };
+  });
+}
+
+function handleAgentEvent(evt) {
+  const t = evt.type;
+  if (t === 'thinking' && evt.text) pushEventLine('💭 ' + evt.text);
+  else if (t === 'tool_call') pushEventLine('🔧 调用工具 ' + (evt.name || evt.tool || ''));
+  else if (t === 'tool_result') pushEventLine('✓ 工具返回');
+  else if (t === 'reply' || t === 'done') {
+    const text = evt.text || evt.reply || '';
+    if (text) AGENT.history.push({ role: 'assistant', text });
+    if (t === 'done') { AGENT.busy = false; setAgentSending(false); }
+    renderAgentHistory();
+  } else if (t === 'error') {
+    AGENT.history.push({ role: 'event', text: '出错：' + (evt.message || '') });
+    AGENT.busy = false; setAgentSending(false);
+    renderAgentHistory();
+  }
+}
+
+function pushEventLine(text) {
+  // Coalesce consecutive event lines to keep the log tidy.
+  AGENT.history.push({ role: 'event', text });
+  renderAgentHistory();
+}
+
+function setAgentSending(sending) {
+  const btn = $('#ag-send');
+  if (btn) { btn.disabled = sending; btn.textContent = sending ? '思考中…' : '发送'; }
+}
+
+async function agentSend() {
+  if (AGENT.busy) return;
+  const text = ($('#ag-text').value || '').trim();
+  if (!text && !AGENT.pending.length) { toast('请输入消息', 'err'); return; }
+  let ws;
+  try { ws = await ensureAgentWs(); }
+  catch (e) { toast(e.message, 'err'); return; }
+
+  const attachments = AGENT.pending.slice();
+  AGENT.history.push({ role: 'user', text: text + (attachments.length ? `  [${attachments.length} 个附件]` : '') });
+  AGENT.pending = [];
+  renderAttachments();
+  renderAgentHistory();
+  $('#ag-text').value = '';
+  AGENT.busy = true;
+  setAgentSending(true);
+  ws.send(JSON.stringify({ type: 'chat', text, attachments }));
 }
 
 boot();

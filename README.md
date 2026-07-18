@@ -6,8 +6,12 @@
 - 🔐 **登录**：应用内完成小米账号 OAuth2 授权，凭证缓存于本地。
 - 📡 **设备控制**：自动加载设备的 MIoT **SPEC** 功能定义，并生成对应的控制控件
   （开关、滑块、下拉选项、动作按钮），可实时读取与设置属性、执行动作。
-- 📷 **摄像头**：列出账号下的米家摄像头设备，并通过 P2P 原生库拉取实时画面
-  （见下方「关于摄像头」）。
+- 🏠 **Miloco**：通过界面用 Docker（`--network host`）一键启动/停止小米官方的感知家庭网关
+  [Xiaomi Miloco](https://github.com/XiaoMi/xiaomi-miloco)，**自动把本机米家凭据注入给
+  Miloco**（无需重新绑定账号），并在应用内预览 Miloco 的 Web 控制台（见下方「关于 Miloco」）。
+- 🤖 **SSR 助手**：内置进 Python 运行时的 SSR 智能体作为主 Agent，可在界面上配置模型、进行
+  聊天（支持**粘贴图片 / 上传文件**）；Miloco 的家庭事件会进入 SSR 的事件总线，供 bus event
+  handler 处理（见下方「关于 SSR 助手」）。
 - 🪟 **托盘驻留**：点击关闭按钮收起到系统托盘；托盘右键可「显示主界面 / 快捷控制面板 / 退出」。
 - 🎛️ **快捷控制面板**：托盘弹出的小窗，可直接调节默认音箱音量、播放/暂停，并
   **非静默执行自然语言指令**。
@@ -25,8 +29,8 @@
 │  renderer/ (HTML/JS/CSS) │ ◀────────────────────────────  │  backend/server.py        │
 └─────────────────────────┘                                 │  封装 miot_kit            │
             ▲                                                │  · 设备 / 家庭 / SPEC      │
-            │ preload.js (contextBridge)                     │  · 属性 get/set · action   │
-┌─────────────────────────┐                                 │  · 摄像头 WebSocket 流     │
+            │ preload.js (contextBridge)                     │  · 小爱 ASR/TTS · Miloco   │
+┌─────────────────────────┐                                 │  · SSR 助手 (/ws/agent)   │
 │  Electron 主进程 main.js │  spawn ────────────────────────▶│                            │
 │  · 启动并托管后端进程     │                                 └──────────────────────────┘
 └─────────────────────────┘
@@ -69,7 +73,8 @@ npm start          # 启动应用
   - 可写 `bool` → 开关；带 `value-range` 的整数 → 滑块；带 `value-list` → 下拉框；
     其余 → 文本框。只读属性提供「读取」按钮，动作提供「执行」按钮。
   - 顶部「读取全部状态」一次性批量拉取所有可读属性的当前值。
-- **摄像头**：切换到「摄像头」标签查看设备列表，点「播放」拉流。
+- **Miloco**：切换到「Miloco」标签，见下方「关于 Miloco」。
+- **SSR 助手**：切换到「SSR 助手」标签，见下方「关于 SSR 助手」。
 - **小爱音箱**：切换到「小爱音箱」标签，见下方「关于小爱音箱」。
 
 ## 关于小爱音箱
@@ -96,20 +101,42 @@ npm start          # 启动应用
    包（同一套 `miservice` Token 格式，可直接复用 Token 文件）上，用几行代码监听 ASR / 接管
    播报，开发自己的小爱音箱机器人——不依赖本应用即可运行。
 
-## 关于摄像头实时画面
+## 关于 Miloco
 
-miot-kit 的摄像头实时画面依赖一个平台相关的 P2P 原生库
-`miot_camera_lite`（位于 `miot_kit/miot/libs/<平台>/`）。仓库仅自带
-**linux / macOS** 版本，**不含 Windows DLL**。
+[Xiaomi Miloco](https://github.com/XiaoMi/xiaomi-miloco) 是小米官方开源的「感知家庭」网关，
+绑定米家账号后枚举设备/家庭/成员、记录活动事件、运行自动化，并在
+`http://127.0.0.1:1810` 暴露 Web 控制台与 HTTP API。
 
-因此在 Windows 上：
+「Miloco」标签页做了三件事（后端 `miloco_controller.py`）：
 
-- 摄像头设备会正常列出，并可在「设备控制」中通过 SPEC 控制；
-- **实时视频无法解码**，界面会给出明确提示。
+1. **Docker 启动**：以 `docker run --network host` 方式运行 Miloco。镜像缺失时可点击
+   「构建镜像」，后端用 `docker/miloco/Dockerfile` 从官方源构建（首次较慢）。
+2. **自动注入凭据**：Miloco 把米家 OAuth Token 存在其 SQLite `kv` 表的
+   `MIOT_TOKEN_INFO_KEY` 键下（`MIoTOauthInfo` 的 JSON）；本应用在 `~/.miot_cache` 里缓存的
+   正是**同一种** `MIoTOauthInfo`（两边都用上游 `miot` 库，字段完全一致）。因此启动前后端会把
+   本机 Token 直接写进 Miloco 的数据库（`$MILOCO_HOME/miloco.db`，默认在
+   `~/.miot_cache/miloco_home/`），Miloco 启动即已绑定，无需再走一次 OAuth。
+3. **Web 预览**：Miloco 就绪后，用 Electron `<webview>` 内嵌其控制台（自动带上
+   Miloco 首次启动生成的 `server.token`）。
 
-后端已实现完整的 WebSocket 推流管线（解码 JPEG 帧 → 推送到渲染进程），
-一旦把对应平台的 `miot_camera_lite.dll` 放入
-`miot_kit/miot/libs/windows/x86_64/`，应用会自动检测并启用实时画面，无需改代码。
+> 注：Docker Desktop 对 `--network host` 的支持在 macOS/Windows 上有限制，此处按需求显式使用
+> host 网络模式。
+
+## 关于 SSR 助手
+
+[SSR](https://github.com/NannaOlympicBroadcast/ssr-agent) 是一个命令行智能体，被**内置进本应用的
+Python 运行时**作为驱动 Miloco 的主 Agent（后端 `ssr_agent_bridge.py`）。「SSR 助手」标签页：
+
+1. **模型配置**：读写 SSR 自己的 `~/.ssr/models.json` 与 `~/.ssr/.env`，可设置主模型
+   （provider / 模型名 / API Key / Base URL）。
+2. **聊天**：通过 `/ws/agent` WebSocket 与 `SSRAgent` 对话，实时streaming
+   `turn_start`/`thinking`/`tool_call`/`tool_result`/`reply` 事件。支持**粘贴图片**（作为多模态
+   图片输入）与**上传文件**（保存到 Agent 工作目录，供其用文件工具读取）。
+3. **Miloco → 总线**：启动时挂载 SSR 的 `MilocoActivityBridge`，把 Miloco 的家庭活动事件
+   （`miloco.activity.*`）投递到 SSR 事件总线，供 SSR 的 bus event handler 实时响应。
+
+未在后端 Python 环境安装 ssr-agent 时，该标签页会给出安装指引而不会影响其它功能
+（可 `pip install ssr-agent`，或设置 `SSR_AGENT_PATH` 指向其源码目录）。
 
 ## 打包为独立 exe（内置 Python 运行环境）
 
@@ -150,12 +177,15 @@ miot-desktop/
 ├── main.js               # 主进程：启动后端(dev=python / prod=exe) + 窗口 + 托盘 + 自启
 ├── preload.js            # contextBridge 暴露后端地址与 IPC
 ├── backend/
-│   ├── server.py           # aiohttp 后端，封装 miot_kit（含登录/设备/SPEC/摄像头/小爱音箱路由）
+│   ├── server.py           # aiohttp 后端，封装 miot_kit（登录/设备/SPEC + 小爱/Miloco/SSR 路由）
 │   ├── xiaomi_asr_bridge.py # 小爱音箱 passport 登录 + ASR 轮询 + Webhook 推送 + TTS 接管
+│   ├── miloco_controller.py # Miloco 的 Docker 启停 + 米家凭据注入 + 健康检查
+│   ├── ssr_agent_bridge.py  # 内置 SSR 智能体：模型配置 + 聊天(图片/文件) + Miloco→总线
 │   ├── requirements.txt
 │   └── miot-backend.spec   # PyInstaller 打包脚本
+├── docker/miloco/Dockerfile # 从官方源构建 Miloco 镜像（Miloco 标签页按需构建）
 ├── renderer/
-│   ├── index.html / styles.css / app.js   # 主界面：登录、设备、SPEC 控件、摄像头、小爱音箱、设置
+│   ├── index.html / styles.css / app.js   # 主界面：设备、Miloco、SSR 助手、小爱音箱、设置
 │   └── quick.html / quick.js              # 托盘快捷控制面板
 ├── vendor/miot_kit/miot/ # 内置的 miot 库（供打包）
 ├── build/icon.ico        # 应用图标

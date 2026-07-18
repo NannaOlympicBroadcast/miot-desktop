@@ -233,6 +233,8 @@ function createMainWindow() {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
       nodeIntegration: false,
+      // The Miloco tab embeds the local Miloco dashboard via a <webview>.
+      webviewTag: true,
     },
   });
   mainWindow.removeMenu();
