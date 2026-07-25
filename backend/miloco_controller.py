@@ -35,9 +35,10 @@ import secrets
 import shutil
 import sqlite3
 import subprocess
+import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 
@@ -152,6 +153,39 @@ class MilocoController:
         self._build_error: Optional[str] = None
         self._build_steps: Dict[str, Dict[str, Any]] = {}
         self._build_order: List[str] = []
+        # `_build_base_seq` is how many lines have already been dropped off the
+        # front of `_build_log`, so a line's absolute sequence number stays
+        # stable across trimming and clients can resume with ?since= instead of
+        # re-fetching (and re-rendering) the whole tail every poll.
+        self._build_base_seq = 0
+        self._build_started_at: Optional[float] = None
+        self._build_finished_at: Optional[float] = None
+        self._build_exit_code: Optional[int] = None
+        self._build_lock = threading.Lock()
+        # Why the last `start()` failed, when docker accepted `run -d` but the
+        # container died immediately (bad image, port clash, mount denied…).
+        self._start_error: Optional[str] = None
+
+    # ------------------------------------------------------------ build log io
+    def _build_log_path(self) -> Path:
+        return MILOCO_HOME / "build.log"
+
+    def _append_build_line(self, line: str, sink: Optional[Any] = None) -> None:
+        """Record one build output line. Called from the reader thread."""
+        with self._build_lock:
+            self._build_log.append(line)
+            # Keep memory bounded but never renumber: dropping N lines advances
+            # the base sequence by exactly N.
+            if len(self._build_log) > 4000:
+                del self._build_log[:2000]
+                self._build_base_seq += 2000
+            _parse_build_line(self._build_steps, self._build_order, line)
+        if sink is not None:
+            try:
+                sink.write(line + "\n")
+                sink.flush()
+            except OSError:
+                pass
 
     # ------------------------------------------------------------ docker probe
     async def docker_available(self) -> bool:
@@ -324,21 +358,26 @@ class MilocoController:
         """
         if self._build_task is not None and not self._build_task.done():
             return
-        self._build_log = []
-        self._build_error = None
-        self._build_steps = {}
-        self._build_order = []
+        with self._build_lock:
+            self._build_log = []
+            self._build_error = None
+            self._build_steps = {}
+            self._build_order = []
+            self._build_base_seq = 0
+            self._build_started_at = time.time()
+            self._build_finished_at = None
+            self._build_exit_code = None
         self._build_task = asyncio.create_task(
             self._build_image_impl(pip_mirror, apt_mirror, registry_mirror))
 
     async def _build_image_impl(self, pip_mirror: str, apt_mirror: str, registry_mirror: str) -> None:
         docker = _docker_bin()
         if not docker:
-            self._build_error = "未检测到 docker，请先安装 Docker。"
+            self._fail_build("未检测到 docker，请先安装 Docker。")
             return
         dockerfile = _DOCKERFILE_DIR / "Dockerfile"
         if not dockerfile.exists():
-            self._build_error = f"未找到 Dockerfile：{dockerfile}"
+            self._fail_build(f"未找到 Dockerfile：{dockerfile}")
             return
 
         registry_prefix = _resolve_mirror(registry_mirror, REGISTRY_MIRRORS)
@@ -351,36 +390,94 @@ class MilocoController:
             "--build-arg", f"APT_MIRROR={_resolve_mirror(apt_mirror, APT_MIRRORS)}",
             str(_DOCKERFILE_DIR),
         ]
-        self._build_log.append("$ " + " ".join(cmd))
+        self._append_build_line("$ " + " ".join(cmd))
 
         def _call() -> int:
             env = {**os.environ, "DOCKER_BUILDKIT": "1"}
+            # Read raw bytes and decode as UTF-8 ourselves. `text=True` would
+            # decode with the *locale* codec, which on a zh-CN Windows box is
+            # cp936 — and a single byte BuildKit emits that's illegal in GBK
+            # (0x80/0xa0/0xff all are) raises UnicodeDecodeError mid-iteration,
+            # killing the reader and freezing the log with no output at all.
             proc = subprocess.Popen(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env)
             assert proc.stdout is not None
-            for line in proc.stdout:
-                line = line.rstrip()
-                self._build_log.append(line)
-                if len(self._build_log) > 2000:
-                    del self._build_log[:1000]
-                _parse_build_line(self._build_steps, self._build_order, line)
+            try:
+                MILOCO_HOME.mkdir(parents=True, exist_ok=True)
+                sink = open(self._build_log_path(), "w", encoding="utf-8", errors="replace")
+            except OSError:
+                sink = None
+            try:
+                for raw in proc.stdout:
+                    self._append_build_line(
+                        raw.decode("utf-8", "replace").rstrip("\r\n"), sink)
+            finally:
+                if sink is not None:
+                    sink.close()
             return proc.wait()
 
         try:
             code = await asyncio.get_event_loop().run_in_executor(None, _call)
         except Exception as e:  # pylint: disable=broad-except
-            self._build_error = str(e)
+            self._fail_build(str(e))
             return
+        with self._build_lock:
+            self._build_exit_code = code
+            self._build_finished_at = time.time()
         if code != 0:
             self._build_error = f"镜像构建失败（exit {code}）。请查看构建日志。"
+            self._append_build_line(f"$ 构建失败，docker build 退出码 {code}")
+        elif not await self.image_exists():
+            # docker build reported success but the tag isn't there — treat it
+            # as a failure rather than sending the user to a "启动" button that
+            # will immediately reject them.
+            self._build_error = f"构建进程返回成功，但镜像 {IMAGE_NAME} 不存在。请查看构建日志。"
+        else:
+            self._append_build_line(f"$ 构建成功，镜像 {IMAGE_NAME} 已就绪")
 
-    def build_status(self) -> Dict[str, Any]:
+    def _fail_build(self, message: str) -> None:
+        """Record a build failure *in the log too*, so the UI's log pane always
+        explains an empty/short build instead of just going quiet."""
+        self._build_error = message
+        with self._build_lock:
+            self._build_finished_at = time.time()
+        self._append_build_line("$ " + message)
+
+    def build_status(self, since: int = 0) -> Dict[str, Any]:
+        """Snapshot of the build for the UI.
+
+        Args:
+            since: absolute sequence number the client already has. Only lines
+                at or after it are returned, so the client appends instead of
+                repainting (and never silently loses lines that scrolled past a
+                fixed-size tail between two polls).
+        """
         running = self._build_task is not None and not self._build_task.done()
+        with self._build_lock:
+            base, total = self._build_base_seq, self._build_base_seq + len(self._build_log)
+            start = max(0, min(int(since), total) - base)
+            lines = self._build_log[start:]
+            steps = [dict(self._build_steps[i]) for i in self._build_order
+                     if i in self._build_steps]
+            started, finished = self._build_started_at, self._build_finished_at
+            exit_code = self._build_exit_code
         return {
             "building": running,
             "error": self._build_error,
+            # Absolute sequence of the first returned line, so a client that
+            # fell behind the trim window can tell it lost some.
+            "first_seq": base + start,
+            "next_seq": total,
+            "lines": lines,
+            # Kept for older clients that render the whole tail each poll.
             "log_tail": self._build_log[-200:],
-            "steps": [self._build_steps[i] for i in self._build_order],
+            "steps": steps,
+            "started_at": started,
+            "finished_at": finished,
+            "exit_code": exit_code,
+            "elapsed": (finished or time.time()) - started if started else None,
+            "log_path": str(self._build_log_path()),
+            "image_name": IMAGE_NAME,
         }
 
     # ------------------------------------------------------------ run / stop
@@ -416,12 +513,54 @@ class MilocoController:
             "-v", f"{MILOCO_HOME}:/data/miloco",
             IMAGE_NAME,
         ]
+        self._start_error = None
         r = await _run(cmd, timeout=60)
         if r.returncode != 0:
-            raise RuntimeError(f"启动容器失败：{(r.stderr or r.stdout or '').strip()}")
+            self._start_error = (r.stderr or r.stdout or "").strip()
+            raise RuntimeError(f"启动容器失败：{self._start_error}")
+
+        # `docker run -d` returns as soon as the container is created — a crash
+        # a second later (missing entrypoint, port already bound, mount denied)
+        # would otherwise surface as a silent "未运行". Give it a moment and
+        # report the real reason from the container's own logs.
+        state, exit_code = await self._settle(timeout=3.0)
+        if state is not None and state != "running":
+            tail = (await self.logs(tail=40)).strip()
+            self._start_error = tail or f"容器启动后未能保持运行（state={state}）"
+            code = f"exit {exit_code}" if exit_code is not None else f"state={state}"
+            raise RuntimeError(f"容器启动后立即退出（{code}）。容器日志：\n{self._start_error}")
+
         status = await self.status()
         status["seeded_credentials"] = seeded
         return status
+
+    # States meaning "not up": a plain exit, or — because the container runs
+    # with `--restart unless-stopped` — a crash loop, which docker reports as
+    # `restarting` rather than ever settling on `exited`.
+    _DEAD_STATES = ("exited", "dead", "restarting")
+
+    async def _settle(self, timeout: float = 3.0) -> Tuple[Optional[str], Optional[int]]:
+        """Poll the container's state briefly after start; return (state, exit
+        code). Long enough to catch an immediate crash (bad entrypoint, port
+        clash, denied mount all fail within a second) without stalling the
+        happy path — a later crash is caught by the periodic status poll."""
+        docker = _docker_bin()
+        deadline = time.time() + timeout
+        state = await self._container_state()
+        while time.time() < deadline:
+            state = await self._container_state()
+            if state in self._DEAD_STATES:
+                break
+            await asyncio.sleep(0.4)
+        code = None
+        if docker and state in self._DEAD_STATES:
+            r = await _run([docker, "inspect", "-f", "{{.State.ExitCode}}", CONTAINER_NAME], timeout=10)
+            if r.returncode == 0:
+                try:
+                    code = int((r.stdout or "").strip())
+                except ValueError:
+                    code = None
+        return state, code
 
     async def stop(self) -> Dict[str, Any]:
         docker = _docker_bin()
@@ -437,10 +576,15 @@ class MilocoController:
 
     async def logs(self, tail: int = 200) -> str:
         docker = _docker_bin()
-        if not docker or await self._container_state() is None:
-            return ""
+        if not docker:
+            return "未检测到 docker，无法读取容器日志。"
+        if await self._container_state() is None:
+            return f"容器 {CONTAINER_NAME} 尚未创建（还没有启动过 Miloco）。"
         r = await _run([docker, "logs", "--tail", str(tail), CONTAINER_NAME], timeout=20)
-        return (r.stdout or "") + (r.stderr or "")
+        out = (r.stdout or "") + (r.stderr or "")
+        if r.returncode != 0 and not out.strip():
+            return f"读取容器日志失败（exit {r.returncode}）。"
+        return out if out.strip() else "容器已创建但尚未输出任何日志。"
 
     # ------------------------------------------------------------- health
     async def _health(self) -> bool:
@@ -457,6 +601,14 @@ class MilocoController:
         healthy = await self._health() if container_state == "running" else False
         token = self.server_token()
         preview_url = MILOCO_URL + (f"/?token={token}" if token else "/")
+        exit_code = None
+        if docker and container_state in self._DEAD_STATES:
+            r = await _run([docker, "inspect", "-f", "{{.State.ExitCode}}", CONTAINER_NAME], timeout=10)
+            if r.returncode == 0:
+                try:
+                    exit_code = int((r.stdout or "").strip())
+                except ValueError:
+                    exit_code = None
         return {
             "docker_available": await self.docker_available(),
             "image_exists": await self.image_exists() if docker else False,
@@ -464,6 +616,8 @@ class MilocoController:
             "container_state": container_state,
             "running": container_state == "running",
             "healthy": healthy,
+            "exit_code": exit_code,
+            "start_error": self._start_error,
             "url": MILOCO_URL,
             "preview_url": preview_url,
             "has_server_token": bool(token),

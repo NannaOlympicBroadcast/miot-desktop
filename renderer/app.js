@@ -825,6 +825,14 @@ let MILOCO = {
   status: null, buildPoll: null, statusPoll: null,
   building: false, showMirrors: false, mirrors: loadMirrorPrefs(),
   lastBuildSteps: [], lastBuildLog: [],
+  // Absolute sequence of the next build-log line we haven't fetched yet, so
+  // each poll appends rather than repainting a fixed-size tail.
+  buildSeq: 0,
+  // Set when polling itself fails. Previously these errors were swallowed,
+  // which made a dead poll look exactly like a build producing no output.
+  buildPollError: null,
+  // Outcome of the last finished build, kept on screen (a toast disappears).
+  lastBuildResult: null,
 };
 
 async function loadMiloco() {
@@ -919,32 +927,68 @@ function renderMiloco() {
     body = `<div class="miloco-preview placeholder">
       <div class="placeholder-icon">📦</div>
       <p>尚未构建 Miloco 镜像。点击「构建镜像」从官方源构建（首次较慢）。</p>
-      <div class="build-progress" id="ml-build-progress" style="display:${MILOCO.building ? 'block' : 'none'}">
-        <div class="build-steps" id="ml-build-steps"></div>
-        <details class="build-log-details">
-          <summary>原始日志</summary>
-          <pre class="xm-code" id="ml-build-log" style="max-height:220px;overflow:auto"></pre>
-        </details>
-      </div>
+      ${renderBuildPanel()}
     </div>`;
   } else {
     body = `<div class="miloco-preview placeholder">
       <div class="placeholder-icon">🏠</div>
       <p>镜像已就绪。点击「启动 Miloco」以 <code>--network host</code> 方式运行，并自动注入米家凭据。</p>
+      ${renderContainerFailure(s)}
+      ${renderBuildPanel()}
     </div>`;
   }
 
   wrap.innerHTML = `<div class="miloco-panel">${controls}${mirrors}${credNote}${body}</div>`;
   bindMilocoEvents();
-  // If a build is in progress, resume streaming it — repaint what we already
-  // know immediately (no flicker while waiting for the next poll tick) and
-  // keep the interval that feeds it running.
+  // Repaint whatever we already know immediately, so a re-render mid-build
+  // never blanks the log while waiting for the next poll tick.
+  renderBuildSteps(MILOCO.lastBuildSteps);
+  appendBuildLog();
+  renderBuildError();
+  if (MILOCO.building) pollMilocoBuild();
+}
+
+// The build progress pane. Rendered whenever a build is running *or* one has
+// finished this session, so the outcome (and its log) stays inspectable
+// instead of vanishing with the toast.
+function renderBuildPanel() {
+  const r = MILOCO.lastBuildResult;
+  if (!MILOCO.building && !r) return '';
+  let summary = '';
   if (MILOCO.building) {
-    renderBuildSteps(MILOCO.lastBuildSteps);
-    const logBox = $('#ml-build-log');
-    if (logBox) logBox.textContent = MILOCO.lastBuildLog.join('\n');
-    pollMilocoBuild();
+    summary = `<div class="build-alert">⏳ 正在构建镜像…（首次构建通常需要数分钟）</div>`;
+  } else if (r && r.ok) {
+    summary = `<div class="build-alert ok">✓ 镜像 <code>${escapeHtml(r.imageName || '')}</code> 构建成功${
+      r.elapsed != null ? `，耗时 ${r.elapsed.toFixed(1)}s` : ''}。</div>`;
+  } else if (r) {
+    summary = `<div class="build-alert err">✗ 镜像构建失败${
+      r.exitCode != null ? `（exit ${r.exitCode}）` : ''}：${escapeHtml(r.error || '未知错误')}</div>`;
   }
+  const logPath = r && r.logPath
+    ? `<div class="hint">完整日志：<code>${escapeHtml(r.logPath)}</code></div>` : '';
+  return `<div class="build-progress" id="ml-build-progress">
+    ${summary}
+    <div class="build-alert err" id="ml-build-alert" style="display:none"></div>
+    <div class="build-steps" id="ml-build-steps"></div>
+    <details class="build-log-details" ${MILOCO.building || (r && !r.ok) ? 'open' : ''}>
+      <summary>原始日志</summary>
+      <pre class="xm-code" id="ml-build-log" style="max-height:220px;overflow:auto"></pre>
+    </details>
+    ${logPath}
+  </div>`;
+}
+
+// Explain a container that was started but isn't running, instead of silently
+// falling back to "未运行".
+function renderContainerFailure(s) {
+  if (!s.container_state || s.running) return '';
+  const code = s.exit_code != null ? `（exit ${s.exit_code}）` : '';
+  const detail = s.start_error
+    ? `<pre class="xm-code" style="max-height:160px;overflow:auto;margin-top:8px">${escapeHtml(s.start_error)}</pre>`
+    : '';
+  return `<div class="build-alert err" style="max-width:560px">
+    ✗ 容器已停止${code}：<code>${escapeHtml(s.container_state)}</code>。点击「查看日志」了解详情。${detail}
+  </div>`;
 }
 
 function renderMirrorRow(kind, label) {
@@ -1010,30 +1054,81 @@ async function milocoBuild() {
     MILOCO.building = true;
     MILOCO.lastBuildSteps = [];
     MILOCO.lastBuildLog = [];
-    renderMiloco();
-    pollMilocoBuild();
+    MILOCO.buildSeq = 0;
+    MILOCO.buildPollError = null;
+    MILOCO.lastBuildResult = null;
+    renderMiloco();  // renders the panel and starts the poll
   } catch (e) { toast('构建失败：' + e.message, 'err'); }
 }
 
 async function pollMilocoBuild() {
-  clearInterval(MILOCO.buildPoll);
-  MILOCO.buildPoll = setInterval(async () => {
+  // Don't restart a poll that's already running: renderMiloco() also calls
+  // this, so a re-render mid-build must not reset the interval (repeated
+  // resets faster than the interval would starve it entirely).
+  if (MILOCO.buildPoll) return;
+  const tick = async () => {
     let st;
-    try { st = await api('/api/miloco/build/status'); } catch (e) { return; }
+    try {
+      st = await api('/api/miloco/build/status?since=' + MILOCO.buildSeq);
+      MILOCO.buildPollError = null;
+    } catch (e) {
+      // Surface it. A silently-swallowed poll error is indistinguishable from
+      // a build that simply hasn't printed anything yet.
+      MILOCO.buildPollError = e.message;
+      renderBuildError();
+      return;
+    }
     MILOCO.lastBuildSteps = st.steps || [];
-    MILOCO.lastBuildLog = st.log_tail || [];
-    const logBox = $('#ml-build-log');
-    if (logBox) { logBox.textContent = MILOCO.lastBuildLog.join('\n'); logBox.scrollTop = logBox.scrollHeight; }
+    if (Array.isArray(st.lines) && st.lines.length) {
+      MILOCO.lastBuildLog = MILOCO.lastBuildLog.concat(st.lines);
+      if (MILOCO.lastBuildLog.length > 5000) {
+        MILOCO.lastBuildLog.splice(0, MILOCO.lastBuildLog.length - 5000);
+      }
+    }
+    if (typeof st.next_seq === 'number') MILOCO.buildSeq = st.next_seq;
+    appendBuildLog();
     renderBuildSteps(MILOCO.lastBuildSteps);
+    renderBuildError();
     if (!st.building) {
       clearInterval(MILOCO.buildPoll);
       MILOCO.buildPoll = null;
       MILOCO.building = false;
+      MILOCO.lastBuildResult = {
+        ok: !st.error, error: st.error, exitCode: st.exit_code,
+        elapsed: st.elapsed, logPath: st.log_path, imageName: st.image_name,
+      };
       if (st.error) toast('镜像构建失败：' + st.error, 'err');
       else toast('镜像构建完成', 'ok');
       loadMiloco();
     }
-  }, 1500);
+  };
+  MILOCO.buildPoll = setInterval(tick, 1500);
+  tick();  // paint immediately instead of waiting out the first interval
+}
+
+function appendBuildLog() {
+  const box = $('#ml-build-log');
+  if (!box) return;
+  const text = MILOCO.lastBuildLog.join('\n');
+  if (box.textContent === text) return;
+  // Only autoscroll when already pinned to the bottom, so scrolling back to
+  // read an error isn't yanked away by the next line.
+  const pinned = box.scrollHeight - box.scrollTop - box.clientHeight < 24;
+  box.textContent = text;
+  if (pinned) box.scrollTop = box.scrollHeight;
+}
+
+function renderBuildError() {
+  const box = $('#ml-build-alert');
+  if (!box) return;
+  if (MILOCO.buildPollError) {
+    box.style.display = 'block';
+    box.className = 'build-alert err';
+    box.textContent = '⚠ 无法获取构建进度：' + MILOCO.buildPollError + '（构建可能仍在后台进行）';
+  } else {
+    box.style.display = 'none';
+    box.textContent = '';
+  }
 }
 
 async function milocoStart() {
