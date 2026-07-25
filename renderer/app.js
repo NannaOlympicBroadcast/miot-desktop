@@ -801,6 +801,16 @@ const MILOCO_MIRROR_PRESETS = {
     { value: 'daocloud', label: 'DaoCloud' },
     { value: 'custom', label: '自定义…' },
   ],
+  // Building the web dashboard runs `pnpm install` inside the image, which
+  // hits the npm registry from the same restricted networks pip/apt/docker.io
+  // above need mirrors for.
+  npm: [
+    { value: 'default', label: '官方 (registry.npmjs.org)' },
+    { value: 'npmmirror', label: 'npmmirror (淘宝)' },
+    { value: 'tencent', label: '腾讯云' },
+    { value: 'huawei', label: '华为云' },
+    { value: 'custom', label: '自定义…' },
+  ],
 };
 
 function loadMirrorPrefs() {
@@ -808,7 +818,10 @@ function loadMirrorPrefs() {
     const raw = localStorage.getItem('miloco_mirror_prefs');
     if (raw) return JSON.parse(raw);
   } catch (e) { /* ignore corrupt/unavailable storage */ }
-  return { pip: 'default', apt: 'default', registry: 'default', pipCustom: '', aptCustom: '', registryCustom: '' };
+  return {
+    pip: 'default', apt: 'default', registry: 'default', npm: 'default',
+    pipCustom: '', aptCustom: '', registryCustom: '', npmCustom: '',
+  };
 }
 
 function saveMirrorPrefs(prefs) {
@@ -906,6 +919,7 @@ function renderMiloco() {
       ${renderMirrorRow('pip', 'PyPI 镜像')}
       ${renderMirrorRow('apt', 'APT 镜像')}
       ${renderMirrorRow('registry', 'Docker 镜像仓库')}
+      ${renderMirrorRow('npm', 'NPM 镜像（构建 Web 控制台用）')}
       <div class="hint">仅影响下一次构建；选择会保存在本机，下次自动沿用。</div>
     </div>` : '';
 
@@ -985,35 +999,37 @@ function renderBuildPanel() {
   </div>`;
 }
 
-// The dashboard URL was probed and did not resolve (404/401/…).
+// The dashboard URL was probed (only happens once healthy) and either didn't
+// resolve or errored outright — either way, not safe to hand to a webview.
 function previewBroken(s) {
-  return typeof s.preview_status === 'number' && s.preview_status >= 400;
+  if (!s.healthy) return false;
+  return s.preview_status == null || s.preview_status >= 400;
 }
 
-// Explain a dashboard that won't load, and say *which* half is broken: a token
-// that couldn't be extracted, or a token that the server rejects.
+// Explain a dashboard that won't load. Miloco's own SPA route only ever
+// returns two error codes for "/", each with one specific cause — 503 when
+// server.token isn't configured yet, 404 when the web build (index.html)
+// isn't there — so the status code alone says which; no need to compare
+// against a second probe.
 function renderTokenDiagnostics(s) {
   const rows = [
     ['配置文件', s.config_path + (s.config_exists ? '' : '（不存在）')],
     ['配置节', (s.config_sections && s.config_sections.length) ? s.config_sections.join(', ') : '（空）'],
     ['Token 来源', s.token_source || '未找到'],
     ['预览地址', s.preview_url],
-    ['预览响应', s.preview_status == null ? '无法连接' : String(s.preview_status)],
-    ['根路径响应', s.root_status == null ? '无法连接' : String(s.root_status)],
+    ['响应状态', s.preview_status == null ? '无法连接' : String(s.preview_status)],
   ].map(([k, v]) => `<tr><td>${escapeHtml(k)}</td><td><code>${escapeHtml(String(v))}</code></td></tr>`).join('');
 
   let verdict;
-  if (!s.has_server_token) {
-    verdict = `未能从 <code>config.json</code> 中提取到 Miloco 的访问 token${
-      s.config_exists ? '（配置文件存在，但没有可用的 token 字段）' : '（Miloco 尚未写出配置文件）'}。`;
-  } else if (s.preview_status === 404 && s.root_status === 404) {
-    // Both the tokenless root and the token URL 404 -> nothing is served here,
-    // so the token isn't the problem.
-    verdict = `token 已提取，但 <code>/</code> 与带 token 的地址都返回 404 —— 该镜像可能只包含后端 API，未内置 Web 控制台。`;
-  } else if (s.preview_status === 401 || s.preview_status === 403) {
-    verdict = `token 已提取但被服务端拒绝（${s.preview_status}），可能已过期或字段不对。`;
+  if (s.preview_status === 503 || !s.has_server_token) {
+    verdict = `Miloco 尚未生成 server.token（config.json 里没有可用的 token 字段），控制台暂时返回 503。` +
+      `通常在容器刚启动、还没写完配置时短暂出现，稍等几秒后「刷新」。`;
+  } else if (s.preview_status === 404) {
+    verdict = `控制台返回 404 —— 该镜像里没有内置 Web 前端（只有后端 API）。` +
+      `如果是用旧版本构建的镜像，重新点击「构建镜像」用最新 Dockerfile 重建即可；` +
+      `如果是刚重建的，说明前端构建步骤失败了，请查看构建日志。`;
   } else {
-    verdict = `带 token 的地址返回 ${s.preview_status}，而根路径返回 ${s.root_status == null ? '无法连接' : s.root_status}。`;
+    verdict = `控制台返回 HTTP ${s.preview_status == null ? '（无法连接）' : s.preview_status}。`;
   }
 
   return `<div class="build-alert err" style="max-width:640px;text-align:left">
@@ -1094,6 +1110,7 @@ async function milocoBuild() {
       pip_mirror: resolvedMirror('pip'),
       apt_mirror: resolvedMirror('apt'),
       registry_mirror: resolvedMirror('registry'),
+      npm_mirror: resolvedMirror('npm'),
     });
     toast('开始构建镜像…', 'ok');
     MILOCO.building = true;
