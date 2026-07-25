@@ -214,6 +214,10 @@ select:focus, .text-input:focus { border-color: var(--primary); }
 .build-alert.ok { border-color: var(--green); color: var(--green); }
 .build-alert.err { border-color: var(--red); color: var(--red); }
 .build-alert code { color: inherit; }
+.ml-diag { border-collapse: collapse; font-size: 12px; text-align: left; max-width: 640px; width: 100%; }
+.ml-diag td { padding: 4px 8px; border-bottom: 1px solid var(--border); vertical-align: top; }
+.ml-diag td:first-child { color: var(--text-soft); white-space: nowrap; width: 96px; }
+.ml-diag code { word-break: break-all; }
 
 /* ---------------- SSR agent tab ---------------- */
 .agent-wrap { flex: 1; overflow: hidden; width: 100%; display: flex; }
