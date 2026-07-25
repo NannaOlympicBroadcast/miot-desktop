@@ -39,7 +39,6 @@ import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import urlencode
 
 import httpx
 
@@ -89,6 +88,14 @@ APT_MIRRORS = {
 REGISTRY_MIRRORS = {
     "default": "",  # pull the base image from docker.io directly
     "daocloud": "docker.m.daocloud.io",
+}
+# The web dashboard build (`pnpm install`) hits the npm registry from inside
+# the build — same restricted-network exposure as PyPI/apt/docker.io above.
+NPM_MIRRORS = {
+    "default": "",  # leave pnpm's default registry.npmjs.org alone
+    "npmmirror": "https://registry.npmmirror.com",
+    "tencent": "https://mirrors.cloud.tencent.com/npm/",
+    "huawei": "https://mirrors.huaweicloud.com/repository/npm/",
 }
 _BASE_IMAGE = "python:3.11-slim"
 
@@ -379,21 +386,10 @@ class MilocoController:
         """Miloco's auto-generated web/API bearer token from its config.json."""
         return self._token_info()[0]
 
-    def _preview_url(self, token: str) -> str:
-        """Dashboard URL for the webview / external browser.
-
-        The token goes through urlencode: interpolating it raw broke every
-        token containing a URL-significant byte — ``#`` truncated the URL at
-        the fragment, ``&`` split it into a second parameter, and ``+`` decoded
-        server-side as a space — each yielding a *different* token than the one
-        in the config, which the server rejects.
-        """
-        return f"{MILOCO_URL}/?{urlencode({'token': token})}" if token else f"{MILOCO_URL}/"
-
     # ------------------------------------------------------------- image build
     async def build_image(
         self, pip_mirror: str = "default", apt_mirror: str = "default",
-        registry_mirror: str = "default",
+        registry_mirror: str = "default", npm_mirror: str = "default",
     ) -> None:
         """Build the Miloco image from the bundled Dockerfile (idempotent).
 
@@ -402,6 +398,8 @@ class MilocoController:
             apt_mirror: a key into APT_MIRRORS, or any raw hostname.
             registry_mirror: a key into REGISTRY_MIRRORS, or any raw
                 registry prefix to pull the base image through.
+            npm_mirror: a key into NPM_MIRRORS, or any raw registry URL, used
+                while building the web dashboard (web/ -> pnpm install).
         """
         if self._build_task is not None and not self._build_task.done():
             return
@@ -415,9 +413,11 @@ class MilocoController:
             self._build_finished_at = None
             self._build_exit_code = None
         self._build_task = asyncio.create_task(
-            self._build_image_impl(pip_mirror, apt_mirror, registry_mirror))
+            self._build_image_impl(pip_mirror, apt_mirror, registry_mirror, npm_mirror))
 
-    async def _build_image_impl(self, pip_mirror: str, apt_mirror: str, registry_mirror: str) -> None:
+    async def _build_image_impl(
+        self, pip_mirror: str, apt_mirror: str, registry_mirror: str, npm_mirror: str,
+    ) -> None:
         docker = _docker_bin()
         if not docker:
             self._fail_build("未检测到 docker，请先安装 Docker。")
@@ -435,6 +435,7 @@ class MilocoController:
             "--build-arg", f"BASE_IMAGE={base_image}",
             "--build-arg", f"PIP_INDEX_URL={_resolve_mirror(pip_mirror, PIP_MIRRORS)}",
             "--build-arg", f"APT_MIRROR={_resolve_mirror(apt_mirror, APT_MIRRORS)}",
+            "--build-arg", f"NPM_REGISTRY={_resolve_mirror(npm_mirror, NPM_MIRRORS)}",
             str(_DOCKERFILE_DIR),
         ]
         self._append_build_line("$ " + " ".join(cmd))
@@ -687,12 +688,19 @@ class MilocoController:
         container_state = await self._container_state() if docker else None
         healthy = await self._health() if container_state == "running" else False
         token, token_source = self._token_info()
-        preview_url = self._preview_url(token)
-        # Probe the exact URL the webview/browser will open, so a 404 is
-        # attributable instead of a mystery: comparing it against the tokenless
-        # root separates "token rejected" from "no dashboard at this route".
+        # The dashboard route (miloco.main:spa_handler) ignores query-string
+        # tokens entirely — it injects server.token server-side into the HTML
+        # it serves at "/", and the frontend JS reads it from there to set an
+        # Authorization header on subsequent /api/* calls. A "?token=..."
+        # query param does nothing here (that fallback only exists for a
+        # couple of non-SPA endpoints like snapshot <img> pulls), so the
+        # preview URL is just the plain root — no token to encode into it.
+        preview_url = f"{MILOCO_URL}/"
+        # Probe it so a bad dashboard load is attributable instead of a
+        # mystery: spa_handler returns 503 when server.token isn't configured
+        # yet and 404 when the static build (index.html) is missing, so the
+        # status code alone tells us which.
         preview_status = await self._probe(preview_url) if healthy else None
-        root_status = await self._probe(f"{MILOCO_URL}/") if healthy else None
         exit_code = None
         if docker and container_state in self._DEAD_STATES:
             r = await _run([docker, "inspect", "-f", "{{.State.ExitCode}}", CONTAINER_NAME], timeout=10)
@@ -715,7 +723,6 @@ class MilocoController:
             "has_server_token": bool(token),
             "token_source": token_source,
             "preview_status": preview_status,
-            "root_status": root_status,
             "config_path": str(self._config_path()),
             "config_exists": self._config_path().exists(),
             "config_sections": sorted(self._read_config().keys()),
