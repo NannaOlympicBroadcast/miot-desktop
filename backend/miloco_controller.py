@@ -39,6 +39,7 @@ import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlencode
 
 import httpx
 
@@ -311,13 +312,8 @@ class MilocoController:
         hot-reload) — harmless either way since a fresh install's token
         starts unset (open) until the first successful pairing.
         """
-        config_path = MILOCO_HOME / "config.json"
-        try:
-            data = json.loads(config_path.read_text("utf-8")) if config_path.exists() else {}
-            if not isinstance(data, dict):
-                data = {}
-        except (OSError, json.JSONDecodeError):
-            data = {}
+        config_path = self._config_path()
+        data = self._read_config()
         agent_cfg = data.get("agent") if isinstance(data.get("agent"), dict) else {}
         token = agent_cfg.get("auth_bearer") or secrets.token_hex(16)
         port = os.environ.get("MILOCO_AGENT_WEBHOOK_PORT", "18789")
@@ -334,14 +330,65 @@ class MilocoController:
         os.environ.setdefault("MILOCO_AGENT_WEBHOOK_PORT", port)
         return True
 
+    # Where Miloco's web/API token has been observed to live in config.json,
+    # most specific first. Tried in order so a rename upstream degrades to the
+    # next candidate instead of silently yielding an empty token.
+    _TOKEN_KEYS: Tuple[Tuple[str, ...], ...] = (
+        ("server", "token"),
+        ("server", "auth_token"),
+        ("server", "access_token"),
+        ("server", "auth_bearer"),
+        ("web", "token"),
+        ("token",),
+    )
+
+    def _config_path(self) -> Path:
+        return MILOCO_HOME / "config.json"
+
+    def _read_config(self) -> Dict[str, Any]:
+        try:
+            data = json.loads(self._config_path().read_text("utf-8"))
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def _token_info(self) -> Tuple[str, str]:
+        """Miloco's web/API token and the config key it came from.
+
+        Returns ("", "") when no usable token is present. Only str/int values
+        are accepted: a dict or None under the expected key previously went
+        through ``str()`` and produced a garbage token (``"None"``,
+        ``"{'a': 1}"``) that the server then rejected.
+        """
+        data = self._read_config()
+        for path in self._TOKEN_KEYS:
+            node: Any = data
+            for part in path:
+                node = node.get(part) if isinstance(node, dict) else None
+                if node is None:
+                    break
+            if isinstance(node, bool) or not isinstance(node, (str, int)):
+                continue
+            token = str(node).strip()
+            # Guard against placeholders that are technically strings.
+            if token and token.lower() not in ("none", "null", "false", "0"):
+                return token, ".".join(path)
+        return "", ""
+
     def server_token(self) -> str:
         """Miloco's auto-generated web/API bearer token from its config.json."""
-        try:
-            data = json.loads((MILOCO_HOME / "config.json").read_text("utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return ""
-        server = data.get("server") if isinstance(data, dict) else None
-        return str(server.get("token")) if isinstance(server, dict) and server.get("token") else ""
+        return self._token_info()[0]
+
+    def _preview_url(self, token: str) -> str:
+        """Dashboard URL for the webview / external browser.
+
+        The token goes through urlencode: interpolating it raw broke every
+        token containing a URL-significant byte — ``#`` truncated the URL at
+        the fragment, ``&`` split it into a second parameter, and ``+`` decoded
+        server-side as a space — each yielding a *different* token than the one
+        in the config, which the server rejects.
+        """
+        return f"{MILOCO_URL}/?{urlencode({'token': token})}" if token else f"{MILOCO_URL}/"
 
     # ------------------------------------------------------------- image build
     async def build_image(
@@ -488,11 +535,18 @@ class MilocoController:
         if not await self.image_exists():
             raise RuntimeError(f"镜像 {IMAGE_NAME} 不存在，请先点击「构建镜像」。")
 
-        # Seed our Mi credentials before first boot so Miloco comes up bound,
-        # and point Miloco's agent webhook at this backend's embedded SSR
-        # agent so perception/rule automation reaches it directly.
+        # Seed our Mi credentials before first boot so Miloco comes up bound.
         seeded = self._seed_credentials()
-        self._seed_agent_webhook()
+
+        # Only patch the agent webhook into an existing config. On a *first*
+        # boot there is no config.json yet, and writing a partial one ({"agent":
+        # …}, no "server" section) is what stopped Miloco from generating and
+        # persisting its own web token — leaving server_token() empty forever
+        # and the dashboard URL tokenless. First boot is handled after the
+        # container has written its own complete config (see below).
+        first_boot = not self._config_path().exists()
+        if not first_boot:
+            self._seed_agent_webhook()
 
         state = await self._container_state()
         if state == "running":
@@ -530,9 +584,33 @@ class MilocoController:
             code = f"exit {exit_code}" if exit_code is not None else f"state={state}"
             raise RuntimeError(f"容器启动后立即退出（{code}）。容器日志：\n{self._start_error}")
 
+        if first_boot:
+            # Let Miloco write its own config.json (which is what mints the web
+            # token), then merge our agent section in and restart so it takes
+            # effect. Doing it in this order is what guarantees a token exists.
+            if await self._await_config(timeout=25.0):
+                self._seed_agent_webhook()
+                await _run([docker, "restart", CONTAINER_NAME], timeout=60)
+                await self._settle(timeout=3.0)
+            else:
+                _LOGGER.warning(
+                    "miloco did not write %s within the wait window; agent "
+                    "webhook not seeded", self._config_path())
+
         status = await self.status()
         status["seeded_credentials"] = seeded
         return status
+
+    async def _await_config(self, timeout: float = 25.0) -> bool:
+        """Wait for Miloco to create its config.json *and* put a usable token in
+        it. The file can appear before it's fully populated, so we wait on the
+        token rather than on mere existence."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if self._token_info()[0]:
+                return True
+            await asyncio.sleep(0.5)
+        return bool(self._config_path().exists())
 
     # States meaning "not up": a plain exit, or — because the container runs
     # with `--restart unless-stopped` — a crash loop, which docker reports as
@@ -595,12 +673,26 @@ class MilocoController:
         except Exception:  # pylint: disable=broad-except
             return False
 
+    async def _probe(self, url: str) -> Optional[int]:
+        """HTTP status for `url`, or None if it couldn't be reached."""
+        try:
+            async with httpx.AsyncClient(timeout=4.0, follow_redirects=True) as c:
+                r = await c.get(url)
+                return r.status_code
+        except Exception:  # pylint: disable=broad-except
+            return None
+
     async def status(self) -> Dict[str, Any]:
         docker = _docker_bin()
         container_state = await self._container_state() if docker else None
         healthy = await self._health() if container_state == "running" else False
-        token = self.server_token()
-        preview_url = MILOCO_URL + (f"/?token={token}" if token else "/")
+        token, token_source = self._token_info()
+        preview_url = self._preview_url(token)
+        # Probe the exact URL the webview/browser will open, so a 404 is
+        # attributable instead of a mystery: comparing it against the tokenless
+        # root separates "token rejected" from "no dashboard at this route".
+        preview_status = await self._probe(preview_url) if healthy else None
+        root_status = await self._probe(f"{MILOCO_URL}/") if healthy else None
         exit_code = None
         if docker and container_state in self._DEAD_STATES:
             r = await _run([docker, "inspect", "-f", "{{.State.ExitCode}}", CONTAINER_NAME], timeout=10)
@@ -621,6 +713,12 @@ class MilocoController:
             "url": MILOCO_URL,
             "preview_url": preview_url,
             "has_server_token": bool(token),
+            "token_source": token_source,
+            "preview_status": preview_status,
+            "root_status": root_status,
+            "config_path": str(self._config_path()),
+            "config_exists": self._config_path().exists(),
+            "config_sections": sorted(self._read_config().keys()),
             "has_credentials": self.has_credentials(),
             "miloco_home": str(MILOCO_HOME),
         }
