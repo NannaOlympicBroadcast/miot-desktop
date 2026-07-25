@@ -633,7 +633,16 @@ async def h_miloco_build(request: web.Request) -> web.Response:
 
 
 async def h_miloco_build_status(request: web.Request) -> web.Response:
-    return _json(MILOCO.build_status())
+    """Query: ?since=<seq> — return only build log lines from that sequence on,
+    so the client appends incrementally."""
+    try:
+        try:
+            since = int(request.query.get("since", "0"))
+        except ValueError:
+            since = 0
+        return _json(MILOCO.build_status(since=since))
+    except Exception as err:  # pylint: disable=broad-except
+        return _err(str(err))
 
 
 async def h_miloco_start(request: web.Request) -> web.Response:

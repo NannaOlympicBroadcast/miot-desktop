@@ -209,6 +209,11 @@ select:focus, .text-input:focus { border-color: var(--primary); }
 .build-steps { display: flex; flex-direction: column; gap: 6px; max-height: 240px; overflow-y: auto; margin-bottom: 8px; }
 .build-log-details summary { cursor: pointer; font-size: 12px; color: var(--text-soft); }
 .build-log-details .xm-code { margin-top: 8px; }
+.build-alert { font-size: 13px; line-height: 1.5; padding: 8px 12px; margin-bottom: 8px;
+  border: 1px solid var(--border); border-radius: 8px; background: var(--panel); color: var(--text); }
+.build-alert.ok { border-color: var(--green); color: var(--green); }
+.build-alert.err { border-color: var(--red); color: var(--red); }
+.build-alert code { color: inherit; }
 
 /* ---------------- SSR agent tab ---------------- */
 .agent-wrap { flex: 1; overflow: hidden; width: 100%; display: flex; }
