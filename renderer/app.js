@@ -896,8 +896,14 @@ function renderPrereq(s) {
   // traceback it exists to prevent — say so here rather than after the crash.
   if (s.win_compat && s.win_compat.verified === false) {
     html += `<div class="banner">Windows 兼容层未生效，Miloco 启动会在导入阶段崩溃。
-      请点击「重新安装 / 更新」重建虚拟环境。校验输出：
+      先试「修复兼容层」；仍然失败就点「重新安装 / 更新」重建虚拟环境。校验输出：
       <code>${escapeHtml(String(s.win_compat.detail || '').slice(0, 300))}</code></div>`;
+  } else if (s.win_compat && s.win_compat.write_error) {
+    // Verification passed on an existing layer, but we could no longer write to
+    // the venv — the current install still runs, future patches won't land.
+    html += `<div class="banner">兼容层当前可用，但无法写入虚拟环境（后续补丁将无法生效）：
+      <code>${escapeHtml(String(s.win_compat.write_error).slice(0, 300))}</code>
+      常见原因是权限或杀毒软件锁定，可点「重新安装 / 更新」重建。</div>`;
   }
   if (p.warn.length && !s.web_built) {
     html += `<div class="hint" style="color:var(--red)">⚠ 未检测到 ${escapeHtml(p.warn.join('、'))}，
@@ -936,6 +942,8 @@ function renderMiloco() {
           : `${s.installed ? `<button class="btn primary" id="ml-start">启动 Miloco</button>` : ''}
              <button class="btn ${s.installed ? '' : 'primary'}" id="ml-install"
                ${MILOCO.installing || !prereq.ok ? 'disabled' : ''}>${installLabel}</button>
+             ${s.installed && s.platform === 'windows'
+               ? `<button class="btn" id="ml-repair" ${MILOCO.installing ? 'disabled' : ''}>修复兼容层</button>` : ''}
              <button class="btn" id="ml-mirrors-toggle">${MILOCO.showMirrors ? '收起镜像源' : '镜像源设置'}</button>
              <button class="btn" id="ml-recheck">重新检测</button>`}
         <button class="btn" id="ml-logs">查看日志</button>
@@ -1131,6 +1139,7 @@ function renderBuildSteps(steps) {
 function bindMilocoEvents() {
   const b = (id, fn) => { const el = $('#' + id); if (el) el.addEventListener('click', fn); };
   b('ml-install', milocoInstall);
+  b('ml-repair', milocoRepair);
   b('ml-start', milocoStart);
   b('ml-stop', milocoStop);
   b('ml-logs', milocoShowLogs);
@@ -1239,6 +1248,28 @@ function renderBuildError() {
   } else {
     box.style.display = 'none';
     box.textContent = '';
+  }
+}
+
+// Re-apply the Windows compat layer to an install made by an older build of
+// this app — same thing the installer's step 7/9 does, without reinstalling.
+async function milocoRepair() {
+  const btn = $('#ml-repair');
+  if (btn) { btn.disabled = true; btn.textContent = '修复中…'; }
+  try {
+    const r = await apiPost('/api/miloco/repair', {});
+    const st = (r && r.win_compat) || {};
+    if (st.verified === false) {
+      toast('兼容层仍未生效，请点「重新安装 / 更新」：' + (st.detail || ''), 'err');
+    } else {
+      toast(st.method === 'vmmap-patch'
+        ? '已修复（.pth 钩子无效，已直接修补 vmmap.py）'
+        : '兼容层已就绪', 'ok');
+    }
+    await loadMiloco();
+  } catch (e) {
+    toast('修复失败：' + e.message, 'err');
+    if (btn) { btn.disabled = false; btn.textContent = '修复兼容层'; }
   }
 }
 
