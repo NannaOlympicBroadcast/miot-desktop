@@ -156,8 +156,9 @@ npm start          # 启动应用
    而 Miloco 从 `$MILOCO_HOME/models` 读取——这一步是 Docker 版本没有做、感知功能因此
    不可用的地方）
 6. 创建虚拟环境 `$MILOCO_ROOT/venv`
-7. 依次 `pip install backend/miot`、`backend/miloco`（顺序同镜像构建：先装 `miloco-miot`
-   源码，`miloco` 的同名依赖才不会去找不存在的 Windows wheel）
+7. 依次 `pip install backend/miot`、`backend/miloco`、`cli`（前两者顺序同镜像构建：先装
+   `miloco-miot` 源码，`miloco` 的同名依赖才不会去找不存在的 Windows wheel。第三个是
+   `miloco-cli`——SSR 助手正是通过它拿设备目录、家庭档案并发通知，缺了它助手就是瞎的）
 8. 写入 **Windows 兼容层**（见下）并校验：在虚拟环境里实际执行一次
    `import miloco.main`（Windows 上另加 `os.sysconf` / `zoneinfo` 检查）+ 记录
    `$MILOCO_ROOT/install.json`
@@ -283,7 +284,19 @@ Agent（后端 `ssr_agent_bridge.py`）。相比早期基于完整 `ssr-agent`�
 3. **智能家居人设 + Miloco 数据类型**：`ssr.integrations.miloco.apply_smart_home_scope` 把 Agent
    人设限定为智能家居管家，并把 Miloco 的设备目录 / 感知事件 / 任务 / 规则数据类型作为 embedded
    context 装载，使其只处理智能家居相关请求。
-4. **Miloco ⇄ 总线 / Webhook 双向打通**：启动时挂载 `ssr.integrations.miloco.start_bus_bridge`——
+4. **Miloco 工具装载**：`ssr.integrations.miloco:MilocoTools` 会被登记进 `settings.agent_tools`，
+   助手因此真正**拥有** `miloco_im_push` / `miloco_notify_bind` / `miloco_notify_unbind` /
+   `miloco_habit_suggest` 四个工具（上一条的 `apply_smart_home_scope` 只提供提示词素材——它告诉
+   模型这些工具存在，却不提供工具本身；只做前者的话，小模型会“知道有 `miloco_im_push`”，然后用
+   `run_command echo` 假装查询并编造结果）。
+   同时后端会把 `MILOCO_HOME` / `MILOCO_SERVER_URL` / `MILOCO_SERVER_TOKEN` / `MILOCO_CLI_BIN`
+   导出到自身进程，并把 Miloco 虚拟环境的 `Scripts` 目录加进 `PATH`——因为
+   `ssr.integrations.miloco` 一律通过 `MilocoConfig.from_env()` 与 PATH 上的 `miloco-cli`
+   访问 Miloco，而它默认找的是 `~/.openclaw/miloco`、且 `miloco-cli` 装在 Miloco 自己的虚拟环境里
+   （两者都不匹配本应用的裸机安装，于是设备目录 / 家庭档案 / 工具调用会**静默**退化为空）。
+   「SSR 助手」标签页顶部会显示当前工具装载与 Token 注入状态，装不上时给出明确提示而不是让模型
+   自由发挥。
+5. **Miloco ⇄ 总线 / Webhook 双向打通**：启动时挂载 `ssr.integrations.miloco.start_bus_bridge`——
    一边把 Miloco 的连通性变化投递到 SSR 事件总线供 bus event handler 响应，一边在 Miloco 默认的
    agent webhook 端口（`18789`）启动 `/miloco/webhook` 接收端；`miloco_controller.py` 启动 Miloco
    进程时会把该地址与一个共享 bearer token 写入 Miloco 的 `config.json::agent`，让 Miloco 的感知/

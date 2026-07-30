@@ -21,6 +21,7 @@ and the UI shows how to install it, rather than crashing the backend.
 import base64
 import logging
 import os
+import shutil
 import sys
 import threading
 import time
@@ -34,6 +35,14 @@ _LOGGER = logging.getLogger("miot_desktop.ssr")
 _SSR_PATH = os.environ.get("SSR_AGENT_PATH")
 if _SSR_PATH and os.path.isdir(_SSR_PATH) and _SSR_PATH not in sys.path:
     sys.path.insert(0, _SSR_PATH)
+
+# The tool class ssr.integrations.miloco exposes, in the "module:attr" form
+# settings.agent_tools takes. Constructed with the ToolKit; its callables()
+# returns the four miloco_* tools.
+MILOCO_TOOLS_SPEC = "ssr.integrations.miloco:MilocoTools"
+MILOCO_TOOL_NAMES = (
+    "miloco_im_push", "miloco_notify_bind", "miloco_notify_unbind", "miloco_habit_suggest",
+)
 
 
 def _ssr_importable() -> bool:
@@ -79,6 +88,18 @@ class SSRAgentBridge:
                 apply_smart_home_scope(self._settings)
             except Exception as e:  # pylint: disable=broad-except
                 _LOGGER.info("Miloco smart-home scoping not applied: %s", e)
+            # Register Miloco's own tool surface (miloco_im_push /
+            # miloco_notify_bind / miloco_notify_unbind / miloco_habit_suggest).
+            # apply_smart_home_scope above only supplies *prompt* material — it
+            # tells the agent these tools exist without providing them, so
+            # without this the agent knows the names, has no way to call them,
+            # and (with a small model) answers by inventing results instead.
+            # `agent_tools` is a list of "module:attr" specs the ToolKit imports;
+            # append rather than assign so a user's own ~/.ssr config survives.
+            specs = list(getattr(self._settings, "agent_tools", None) or [])
+            if MILOCO_TOOLS_SPEC not in specs:
+                specs.append(MILOCO_TOOLS_SPEC)
+            self._settings.agent_tools = specs
             self._agent = SSRAgent(self._settings)
             # Attach the Miloco activity → bus bridge so home events reach any
             # SSR bus-event handlers, and start the /miloco/webhook receiver
@@ -127,9 +148,39 @@ class SSRAgentBridge:
                 "has_api_key": bool(settings.gemini_api_key),
                 "missing": missing,
                 "miloco_bridge": self._miloco_bridge is not None,
+                **self.miloco_tooling(),
             }
         except Exception as e:  # pylint: disable=broad-except
             return {"available": True, "error": str(e)}
+
+    def miloco_tooling(self) -> Dict[str, Any]:
+        """Whether the agent can actually reach Miloco, and how.
+
+        Reported because the failure mode is otherwise invisible: an agent with
+        no Miloco tools still answers device questions — it just makes them up.
+        Only inspects a *already-built* agent; building one here would make a
+        status poll expensive.
+        """
+        loaded: List[str] = []
+        agent = self._agent
+        if agent is not None:
+            try:
+                loaded = [getattr(fn, "__name__", "") for fn in agent.toolkit.callables()]
+            except Exception:  # pylint: disable=broad-except
+                loaded = []
+        cli = os.environ.get("MILOCO_CLI_BIN") or shutil.which("miloco-cli")
+        return {
+            "agent_built": agent is not None,
+            "tools": loaded,
+            "miloco_tools": [n for n in MILOCO_TOOL_NAMES if n in loaded],
+            "miloco_tools_expected": list(MILOCO_TOOL_NAMES),
+            # miloco-cli is what the Miloco tools *and* the device-catalog /
+            # home-profile context blocks shell out to; without it they all
+            # degrade to nothing, which is what leaves the agent guessing.
+            "miloco_cli": cli,
+            "miloco_home": os.environ.get("MILOCO_HOME"),
+            "miloco_server_token": bool(os.environ.get("MILOCO_SERVER_TOKEN")),
+        }
 
     # ------------------------------------------------------------ models
     def list_models(self) -> Dict[str, Any]:

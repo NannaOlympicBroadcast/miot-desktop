@@ -1301,6 +1301,31 @@ async function loadAgent() {
   renderAgent();
 }
 
+// Whether the agent can actually reach Miloco. Worth showing prominently: an
+// agent with no Miloco tools doesn't say so — it answers device questions from
+// imagination (a small model will happily `echo` something and narrate a
+// result), and the only visible symptom is a confidently wrong reply.
+function renderAgentMilocoState(s) {
+  if (!s.miloco_cli) {
+    return `<div class="banner">该助手还连不上 Miloco：未找到 <code>miloco-cli</code>。
+      它因此拿不到设备目录、家庭档案，也无法调用 Miloco 的
+      <code>miloco_im_push</code> 等工具——这种情况下模型可能会“凭印象”回答设备状态。
+      请到「Miloco」标签完成安装并启动。</div>`;
+  }
+  const loaded = (s.miloco_tools || []).length;
+  const expected = (s.miloco_tools_expected || []).length;
+  if (s.agent_built && loaded < expected) {
+    return `<div class="banner">Miloco 工具未全部装载（${loaded}/${expected}）。
+      重新发送一条消息会重建助手；若仍不完整，请查看后端日志。</div>`;
+  }
+  const bits = [
+    `Miloco 工具 ${s.agent_built ? `${loaded}/${expected}` : `待装载（${expected}）`}`,
+    s.miloco_server_token ? 'Token 已注入' : 'Token 未就绪',
+    s.miloco_bridge ? '事件总线已连通' : '事件总线未连通',
+  ];
+  return `<div class="hint">✓ ${escapeHtml(bits.join(' · '))}</div>`;
+}
+
 function renderAgent() {
   const s = AGENT.status;
   const wrap = $('#agent-wrap');
@@ -1316,6 +1341,7 @@ function renderAgent() {
       </div>
       ${s.missing && s.missing.length
         ? `<div class="banner">缺少 API Key：${escapeHtml(s.missing.join(', '))}。点击「模型配置」填入后即可对话。</div>` : ''}
+      ${renderAgentMilocoState(s)}
       <div class="agent-config hidden" id="ag-config">
         <div class="xm-form-row"><label>模型 ID</label>
           <input class="text-input" id="ag-id" placeholder="如 my-gemini" value="${escapeHtml(s.primary_model || '')}" /></div>
