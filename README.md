@@ -198,17 +198,26 @@ site-packages 写入两样东西（**不改上游源码**，因为改了会被�
 ### 已经装好、但还在旧版应用上的修复办法
 
 兼容层由应用后端写入，所以**必须先更新应用本身**（开发模式 `git pull` 后重启应用即可；
-打包版需要重新构建 exe）。如果暂时不方便更新，可以直接在 PowerShell 里跑仓库里的独立脚本，
-它不依赖应用、只操作已安装的虚拟环境：
+打包版需要重新构建 exe）。如果暂时不方便更新，可以直接跑仓库里的独立脚本，它不依赖应用、
+只操作已安装的虚拟环境：
 
 ```powershell
-.\scripts\repair_miloco_win.ps1
+git pull
+python scripts\apply_win_compat.py
 # 或指定虚拟环境位置
-.\scripts\repair_miloco_win.ps1 -VenvDir "D:\path\to\miloco_runtime\venv"
+python scripts\apply_win_compat.py --venv "D:\path\to\miloco_runtime\venv"
+# 也可以用等价的 PowerShell 包装
+.\scripts\repair_miloco_win.ps1
 ```
 
-脚本会写入同样的两个补丁文件，然后用虚拟环境实际 `import miloco.main` 验证，成功后回到应用点
-「启动 Miloco」即可。
+脚本会**从 `backend/miloco_controller.py` 里解析出**这两个补丁的源码（因此与应用自己写入的
+内容逐字节一致，不存在第二份会走样的副本），写入虚拟环境，然后用该虚拟环境实际
+`import miloco.main` 验证；`.pth` 钩子不生效时同样会自动回退修补 `vmmap.py`。成功后回到应用
+点「启动 Miloco」即可。
+
+> `.ps1` 只是个瘦包装：Windows PowerShell 5.1 对 LF 换行的 here-string 会解析错位，对无 BOM
+> 文件又按 ANSI 读取（中文会乱码），所以脚本本体是 Python，`.ps1` 保持纯 ASCII + CRLF
+> （仓库用 `.gitattributes` 固定 `*.ps1 text eol=crlf`）。
 
 内存 region 采集（`/proc/self/smaps`）在 Windows 上不可用，Miloco 自己会在启动探测时捕获并标记
 `memory regions not available`，其余监控正常——这与容器行为一致，属于预期降级。
@@ -331,7 +340,9 @@ miot-desktop/
 │   ├── ssr_agent_bridge.py  # 内置 SSR 智能体：模型配置 + 聊天(图片/文件) + Miloco→总线
 │   ├── requirements.txt
 │   └── miot-backend.spec   # PyInstaller 打包脚本
-├── scripts/repair_miloco_win.ps1  # 独立修复脚本：给已装好的 Miloco 虚拟环境补 Windows 兼容层
+├── scripts/
+│   ├── apply_win_compat.py        # 独立修复：给已装好的 Miloco 虚拟环境补 Windows 兼容层
+│   └── repair_miloco_win.ps1      # 上面脚本的 PowerShell 包装（纯 ASCII + CRLF）
 ├── renderer/
 │   ├── index.html / styles.css / app.js   # 主界面：设备、Miloco、SSR 助手、小爱音箱、设置
 │   └── quick.html / quick.js              # 托盘快捷控制面板
