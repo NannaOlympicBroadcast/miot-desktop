@@ -158,21 +158,74 @@ npm start          # 启动应用
 6. 创建虚拟环境 `$MILOCO_ROOT/venv`
 7. 依次 `pip install backend/miot`、`backend/miloco`（顺序同镜像构建：先装 `miloco-miot`
    源码，`miloco` 的同名依赖才不会去找不存在的 Windows wheel）
-8. 写入 `fcntl` 兼容模块并校验（见下）+ 记录 `$MILOCO_ROOT/install.json`
+8. 写入 **Windows 兼容层**（见下）并校验：在虚拟环境里实际执行一次
+   `import miloco.main`（Windows 上另加 `os.sysconf` / `zoneinfo` 检查）+ 记录
+   `$MILOCO_ROOT/install.json`
 
 网络受限时可在「镜像源设置」里选 PyPI / NPM 镜像（选择保存在本机，下次沿用）。首次安装需要
 下载数百 MB（源码含 79 MB 感知模型 + 依赖 wheel），通常几分钟。
 
-> **`fcntl` 兼容模块**：`miloco.home_profile.store` 在模块顶层 `import fcntl` 做跨进程文件锁，
-> 而 `miloco.main` 会导入它——Windows 没有 `fcntl`，因此后端连导入都过不去（这一点已实测确认）。
-> 安装器会往虚拟环境的 site-packages 写一个 `fcntl` 模块，把 `flock()` 映射到
-> `msvcrt.locking()` 的字节区间锁（真锁，不是空实现），从而在**不修改上游源码**的前提下让它跑起来
-> （改源码会被下一次更新覆盖）。
+> 第 8 步为什么要真的 import 一遍：Miloco 至今遇到的每个 Windows 不兼容点都发生在
+> **导入期**（见下），而不是运行期。把 `import miloco.main` 放进安装校验，等于把
+> 「安装成功、一启动就崩」变成「安装失败并附上 traceback」。
+
+### Windows 兼容层
+
+上游只支持 Linux/macOS（安装脚本直接拒绝 Windows），因此有几处 POSIX-only 的标准库调用是
+无条件执行的，且都在 `import` 期就触发——后端来不及打任何日志就退出。安装器会往虚拟环境的
+site-packages 写入两样东西（**不改上游源码**，因为改了会被下一次更新覆盖），并在**每次安装和
+每次启动时**重写，所以旧版本装出来的环境无需重装即可获得新补丁：
+
+| 文件 | 补什么 | 为什么必须 |
+| --- | --- | --- |
+| `fcntl.py` | Windows 完全没有的 `fcntl` 模块；`flock()` 映射到 `msvcrt.locking()` 的字节区间锁（真锁，非空实现） | `miloco.home_profile.store` 顶层 `import fcntl` 做跨进程文件锁，而 `miloco.main` 会导入它 |
+| `miot_desktop_win_compat.py` + `zz-miot-desktop-win-compat.pth` | `os.sysconf`（只回答 `SC_PAGESIZE` / `SC_PAGE_SIZE` / `SC_NPROCESSORS_*`，取真实值；其余按 CPython 语义抛 `ValueError`） | `miloco.node_monitor.vmmap` 在模块顶层求值 `os.sysconf("SC_PAGESIZE")`，而 `resource_monitor` 无条件导入它（那是 macOS-only 代码，平台分发发生在调用时）→ `AttributeError: module 'os' has no attribute 'sysconf'` |
+
+`.pth` 的作用是让 site.py 在**解释器启动时**就执行补丁，早于任何 miloco 模块导入——这也是唯一
+可行的时机。补丁只在有真实 Windows 答案时回答，绝不把失败伪装成成功。
+
+**写了 ≠ 生效**，所以写完还会校验：用虚拟环境自己跑一次
+`import fcntl, miloco.node_monitor.vmmap`。
+
+- 校验通过 → 正常启动。
+- 校验失败（说明该环境没有加载 `.pth` 启动钩子）→ 自动回退：直接把已安装的
+  `vmmap.py` 那一行改成 `os.sysconf(...) if hasattr(os, "sysconf") else mmap.PAGESIZE`，
+  清掉过期的 `__pycache__` 后再校验一次。（这是兜底而非首选：改动会被下次更新覆盖，
+  所以优先用 `.pth`。若上游改了那一行，则**不做**盲目替换，让真实错误暴露出来。）
+- 两次都失败 → 「启动」直接报错并说明原因，而不是启动一个必然崩溃的进程；界面也会显示
+  横幅提示。
+
+### 已经装好、但还在旧版应用上的修复办法
+
+兼容层由应用后端写入，所以**必须先更新应用本身**（开发模式 `git pull` 后重启应用即可；
+打包版需要重新构建 exe）。如果暂时不方便更新，可以直接在 PowerShell 里跑仓库里的独立脚本，
+它不依赖应用、只操作已安装的虚拟环境：
+
+```powershell
+.\scripts\repair_miloco_win.ps1
+# 或指定虚拟环境位置
+.\scripts\repair_miloco_win.ps1 -VenvDir "D:\path\to\miloco_runtime\venv"
+```
+
+脚本会写入同样的两个补丁文件，然后用虚拟环境实际 `import miloco.main` 验证，成功后回到应用点
+「启动 Miloco」即可。
+
+内存 region 采集（`/proc/self/smaps`）在 Windows 上不可用，Miloco 自己会在启动探测时捕获并标记
+`memory regions not available`，其余监控正常——这与容器行为一致，属于预期降级。
+
+### 时区
+
+Miloco 只从 `TZ` / `/etc/timezone` / `/etc/localtime` 推断部署时区（全是 Unix 路径），推断失败就
+兜底 `Asia/Shanghai`。所以在 Windows 上，**所有时间戳本来会一律按中国时区显示**。启动时本应用会
+问虚拟环境里的 `tzlocal`（`apscheduler` 的依赖，Windows 上它还会带上 `tzdata`，这也是 Windows
+`zoneinfo` 能用的前提）拿到真实 IANA 时区名，作为 `MILOCO_TIMEZONE` 传给 Miloco；结果缓存在
+`install.json`。若你已在 `config.json` 里显式写了 `timezone`，则**不覆盖**你的配置。
 
 ### 运行与状态
 
-- **启动**：直接拉起 `$MILOCO_ROOT/venv/Scripts/miloco-backend.exe`，env 里指定
-  `MILOCO_HOME`、`MILOCO_SERVER__PORT`/`MILOCO_SERVER__URL`；进程 stdout/stderr 落到
+- **启动**：先刷新一次 Windows 兼容层（幂等，内容未变则不写盘），再直接拉起
+  `$MILOCO_ROOT/venv/Scripts/miloco-backend.exe`，env 里指定 `MILOCO_HOME`、
+  `MILOCO_SERVER__PORT`/`MILOCO_SERVER__URL`、`MILOCO_TIMEZONE`；进程 stdout/stderr 落到
   `$MILOCO_HOME/backend.log`，pid 记到 `$MILOCO_ROOT/miloco.pid`。
 - **重启本应用后**：会通过 pid 文件**重新接管**仍在运行的 Miloco（并校验该进程确实来自我们的
   虚拟环境，避免 pid 复用误判），不会重复启动第二个实例。
@@ -278,6 +331,7 @@ miot-desktop/
 │   ├── ssr_agent_bridge.py  # 内置 SSR 智能体：模型配置 + 聊天(图片/文件) + Miloco→总线
 │   ├── requirements.txt
 │   └── miot-backend.spec   # PyInstaller 打包脚本
+├── scripts/repair_miloco_win.ps1  # 独立修复脚本：给已装好的 Miloco 虚拟环境补 Windows 兼容层
 ├── renderer/
 │   ├── index.html / styles.css / app.js   # 主界面：设备、Miloco、SSR 助手、小爱音箱、设置
 │   └── quick.html / quick.js              # 托盘快捷控制面板

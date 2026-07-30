@@ -154,6 +154,84 @@ def _resolve_mirror(value: str, presets: Dict[str, str]) -> str:
 
 
 # ---------------------------------------------------------------------------
+# The Windows compatibility layer written into the venv.
+#
+# Upstream supports Linux/macOS only (its installer refuses Windows outright),
+# so a handful of POSIX-only stdlib pieces are used unconditionally *at import
+# time* — the backend dies before it can log anything. Two mechanisms fix that
+# without touching upstream source (which every update would overwrite):
+#
+#   1. `fcntl.py` — a module Windows doesn't have at all (see below).
+#   2. `miot_desktop_win_compat.py` + a `.pth` that imports it, so it runs at
+#      interpreter startup and can fill in missing `os` attributes before any
+#      miloco module is imported (see _WIN_COMPAT_SRC).
+#
+# Both are rewritten on every install *and* every start, so they can't drift and
+# don't need a reinstall to arrive.
+# ---------------------------------------------------------------------------
+_WIN_COMPAT_MODULE = "miot_desktop_win_compat"
+_WIN_COMPAT_PTH = "zz-miot-desktop-win-compat.pth"
+
+_WIN_COMPAT_SRC = '''"""Windows compatibility shims for Miloco — installed by MIoT Desktop.
+
+Loaded at interpreter startup by ``zz-miot-desktop-win-compat.pth`` (site.py
+executes the ``import`` line of every .pth in site-packages). That timing is the
+whole point: the gaps filled here are hit while *importing* miloco, so nothing
+inside miloco could apply them.
+
+Upstream Miloco targets Linux/macOS only, so it reaches for POSIX-only stdlib
+APIs unconditionally. Each shim fills exactly one such gap with a truthful
+Windows answer — nothing is faked into "success" in a way that would hide a real
+failure.
+
+Not meant to be imported by name. Safe to delete: MIoT Desktop rewrites it on
+every install and every start.
+"""
+import os
+
+
+def _install_sysconf():
+    """``os.sysconf`` for the names Miloco actually asks for.
+
+    ``miloco.node_monitor.vmmap`` evaluates ``os.sysconf("SC_PAGESIZE")`` at
+    module scope, and ``miloco.node_monitor.resource_monitor`` imports that
+    module unconditionally even though it is macOS-only code (the platform
+    dispatch happens later, at call time). Without this the whole import chain
+    from ``miloco.main`` dies with:
+
+        AttributeError: module 'os' has no attribute 'sysconf'
+
+    Unknown names raise ValueError, exactly as CPython does for an unrecognised
+    name — so a caller that probes ``hasattr(os, "sysconf")`` expecting a real
+    number (page size, CPU count) gets a correct one instead of a fabricated
+    value, and anything else fails loudly rather than silently wrong.
+    """
+    if hasattr(os, "sysconf"):
+        return
+    import mmap
+
+    values = {
+        # mmap.PAGESIZE comes from GetSystemInfo().dwPageSize — the real thing.
+        "SC_PAGESIZE": lambda: mmap.PAGESIZE,
+        "SC_PAGE_SIZE": lambda: mmap.PAGESIZE,
+        "SC_NPROCESSORS_ONLN": lambda: os.cpu_count() or 1,
+        "SC_NPROCESSORS_CONF": lambda: os.cpu_count() or 1,
+    }
+
+    def sysconf(name):
+        getter = values.get(name) if isinstance(name, str) else None
+        if getter is None:
+            raise ValueError("unrecognized configuration name")
+        return int(getter())
+
+    os.sysconf = sysconf
+    os.sysconf_names = {name: index for index, name in enumerate(sorted(values))}
+
+
+_install_sysconf()
+'''
+
+# ---------------------------------------------------------------------------
 # The `fcntl` shim written into the venv on Windows.
 #
 # `miloco.home_profile.store` imports fcntl at module scope for its
@@ -279,6 +357,22 @@ def _venv_python() -> Path:
 
 def _backend_exe() -> Path:
     return _venv_bin("miloco-backend")
+
+
+def _site_packages() -> Optional[Path]:
+    """The venv's site-packages, without paying for a subprocess.
+
+    Layout is fixed per platform (``Lib\\site-packages`` on Windows,
+    ``lib/pythonX.Y/site-packages`` elsewhere), and this is called on every
+    start — running the interpreter just to ask sysconfig would be wasteful.
+    """
+    if IS_WINDOWS:
+        p = VENV_DIR / "Lib" / "site-packages"
+        return p if p.is_dir() else None
+    for p in sorted((VENV_DIR / "lib").glob("python3.*/site-packages")):
+        if p.is_dir():
+            return p
+    return None
 
 
 def _arch_dir() -> Optional[str]:
@@ -440,6 +534,12 @@ class MilocoController:
         # UI and probing Python costs a subprocess.
         self._env_cache: Optional[Dict[str, Any]] = None
         self._env_cache_at = 0.0
+        # Host IANA timezone; "" means "asked and couldn't tell", None means
+        # "not asked yet" (see _local_timezone).
+        self._tz_cache: Optional[str] = None
+        # Outcome of the last Windows compat-layer refresh (see
+        # _ensure_win_compat); surfaced in status() so an inert shim is visible.
+        self._win_compat: Optional[Dict[str, Any]] = None
 
     # ------------------------------------------------------------ log io
     def _log_path(self) -> Path:
@@ -1037,27 +1137,54 @@ class MilocoController:
             return
         self._step_done("7")
 
-        # -- 8/8 Windows compat shim + smoke check ---------------------------
-        self._step_start("8", "[8/8] 写入兼容补丁并校验安装")
+        # -- 8/8 Windows compat layer + smoke check --------------------------
+        self._step_start("8", "[8/8] 写入 Windows 兼容层并校验安装")
         if IS_WINDOWS:
             try:
-                shim = await self._write_fcntl_shim(vpy)
+                for path in self._write_win_compat():
+                    self._append(f"  兼容层 -> {path}")
             except (OSError, RuntimeError) as e:
-                self._fail("8", f"写入 fcntl 兼容模块失败：{e}")
+                self._fail("8", f"写入 Windows 兼容层失败：{e}")
                 return
-            self._append(f"  fcntl 兼容模块 -> {shim}")
+            # Same write -> verify -> patch-as-fallback path start() uses, so a
+            # fresh install can't hand over an inert layer either.
+            await asyncio.get_event_loop().run_in_executor(None, self._ensure_win_compat)
+            state = self._win_compat or {}
+            self._append(f"  兼容层校验：verified={state.get('verified')} "
+                         f"method={state.get('method')} {state.get('detail', '')}")
+            if state.get("verified") is False:
+                self._fail("8", "Windows 兼容层未生效（虚拟环境不会加载 .pth 启动钩子，"
+                                f"且无法回退修补源码）：{state.get('detail', '')}")
+                return
         if not _backend_exe().exists():
             self._fail("8", f"安装完成但未生成 {_backend_exe()}，请查看上面的安装日志。")
             return
-        check = await _run([vpy, "-c",
-                            "import fcntl, miot, miloco, importlib.metadata as m;"
-                            "print('miloco', m.version('miloco'), '| miloco-miot', m.version('miloco-miot'))"],
-                           env=pip_env, timeout=120)
+        # `import miloco.main` is the check that matters: it walks the whole
+        # import chain the backend walks at startup, which is where every
+        # Windows incompatibility so far has surfaced (fcntl, os.sysconf). Doing
+        # it here turns "install succeeds, start crashes" into a failed install
+        # with the traceback attached.
+        probe = ["import importlib.metadata as m", "import fcntl, miot, miloco"]
+        if IS_WINDOWS:
+            probe += [
+                "import os, zoneinfo",
+                "assert os.sysconf('SC_PAGESIZE') > 0, 'sysconf shim inactive'",
+                # No /usr/share/zoneinfo on Windows: ZoneInfo only works if the
+                # `tzdata` package came along (via apscheduler -> tzlocal).
+                "zoneinfo.ZoneInfo('Asia/Shanghai')",
+            ]
+        probe += [
+            "import miloco.main",
+            "print('miloco', m.version('miloco'), '| miloco-miot', m.version('miloco-miot'))",
+        ]
+        probe_env = {**pip_env, "MILOCO_HOME": str(MILOCO_HOME),
+                     "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"}
+        check = await _run([vpy, "-c", "\n".join(probe)], env=probe_env, timeout=300)
         out = ((check.stdout or "") + (check.stderr or "")).strip()
         for line in out.splitlines():
             self._append("  " + line)
         if check.returncode != 0:
-            self._fail("8", "安装校验失败：虚拟环境中无法导入 miloco / miot（详见日志）。",
+            self._fail("8", "安装校验失败：虚拟环境中无法导入 miloco（详见日志中的 traceback）。",
                        check.returncode)
             return
         self._step_done("8", out.splitlines()[-1] if out else None)
@@ -1073,6 +1200,8 @@ class MilocoController:
             "src": str(SRC_DIR),
             "web_built": web_static.exists(),
             "camera_dll": env_info["camera_dll"],
+            # Resolved here so the first start doesn't have to shell out for it.
+            "local_timezone": self._local_timezone(),
             "versions": out.splitlines()[-1] if out else "",
             "installed_at": time.time(),
         }
@@ -1143,16 +1272,172 @@ class MilocoController:
             self._append(f"  {f.name} ({f.stat().st_size // 1024 // 1024} MB)")
         return copied, len(files)
 
-    async def _write_fcntl_shim(self, venv_python: str) -> Path:
-        """Install the Windows `fcntl` stand-in into the venv's site-packages."""
-        r = await _run([venv_python, "-c",
-                        "import sysconfig;print(sysconfig.get_paths()['purelib'])"], timeout=30)
-        purelib = (r.stdout or "").strip().splitlines()[-1] if r.returncode == 0 and r.stdout.strip() else ""
-        if not purelib:
-            raise RuntimeError("无法定位虚拟环境的 site-packages")
-        target = Path(purelib) / "fcntl.py"
-        target.write_text(_FCNTL_SHIM, "utf-8")
+    def _write_win_compat(self) -> List[Path]:
+        """Write the Windows compatibility layer into the venv's site-packages.
+
+        Idempotent: files whose content already matches are left alone, so this
+        is cheap enough to run on every start — which is what lets an existing
+        install pick up a new shim without being reinstalled. Returns the files
+        that actually changed.
+        """
+        site = _site_packages()
+        if site is None:
+            raise RuntimeError(f"无法定位虚拟环境的 site-packages（{VENV_DIR}）")
+        written: List[Path] = []
+        for name, content in (
+            ("fcntl.py", _FCNTL_SHIM),
+            (f"{_WIN_COMPAT_MODULE}.py", _WIN_COMPAT_SRC),
+            # A .pth's `import` line is executed by site.py at startup; the
+            # "zz-" prefix just keeps it last in the sorted .pth order.
+            (_WIN_COMPAT_PTH, f"import {_WIN_COMPAT_MODULE}\n"),
+        ):
+            target = site / name
+            try:
+                if target.exists() and target.read_text("utf-8") == content:
+                    continue
+            except OSError:
+                pass  # unreadable -> rewrite it
+            target.write_text(content, "utf-8")
+            written.append(target)
+        return written
+
+    def _verify_win_compat(self) -> Tuple[Optional[bool], str]:
+        """Ask the venv itself whether the layer is actually in effect.
+
+        Writing the files is not proof: a ``.pth`` only runs if site.py
+        processes that directory, so a layout or interpreter we didn't
+        anticipate would leave the shim inert — and the backend would then die
+        with exactly the traceback the shim exists to prevent. This runs the
+        same two operations the import chain needs.
+
+        Returns (True | False | None, output): None means the probe itself
+        couldn't run (no interpreter, timeout), which proves nothing.
+
+        It imports the two modules that actually broke rather than asserting
+        ``os.sysconf`` exists — the source-patch fallback below fixes the import
+        *without* adding ``os.sysconf``, so probing for the attribute would
+        report failure on a system that is, in fact, fine.
+        """
+        py = _venv_python()
+        if not py.exists():
+            return None, f"{py} 不存在"
+        try:
+            r = subprocess.run(
+                [str(py), "-c",
+                 "import fcntl, miloco.node_monitor.vmmap; print('compat ok')"],
+                capture_output=True, text=True, timeout=60, creationflags=_no_window())
+        except (OSError, subprocess.SubprocessError) as e:
+            return None, str(e)
+        out = ((r.stdout or "") + (r.stderr or "")).strip()
+        return r.returncode == 0, out
+
+    # The single module-scope POSIX call the compat layer exists for. Patching
+    # installed source is the fallback, not the plan: it has to be redone after
+    # every update, which is why the .pth comes first.
+    _VMMAP_NEEDLE = 'os.sysconf("SC_PAGESIZE")'
+    _VMMAP_REPLACEMENT = ('(os.sysconf("SC_PAGESIZE") if hasattr(os, "sysconf")'
+                          ' else __import__("mmap").PAGESIZE)')
+
+    def _patch_installed_vmmap(self) -> Optional[Path]:
+        """Last-resort: make the installed vmmap.py itself Windows-safe.
+
+        Only reached when the startup hook demonstrably didn't take effect.
+        Returns the patched file, or None if there was nothing to patch (either
+        already done, or upstream changed the line — in which case the error
+        that follows is a real one worth reporting rather than papering over).
+        """
+        site = _site_packages()
+        if site is None:
+            return None
+        target = site / "miloco" / "node_monitor" / "vmmap.py"
+        try:
+            text = target.read_text("utf-8")
+        except OSError:
+            return None
+        if self._VMMAP_REPLACEMENT in text or self._VMMAP_NEEDLE not in text:
+            return None
+        try:
+            target.write_text(text.replace(self._VMMAP_NEEDLE, self._VMMAP_REPLACEMENT, 1), "utf-8")
+            # Drop the stale bytecode, or the edit is ignored until mtime wins.
+            for pyc in (target.parent / "__pycache__").glob("vmmap.*.pyc"):
+                pyc.unlink(missing_ok=True)
+        except OSError:
+            return None
         return target
+
+    def _ensure_win_compat(self) -> None:
+        """Refresh the compat layer before a start, then prove it works.
+
+        Order: write the files -> verify -> patch installed source if the
+        verification says the hook is inert -> verify again. The outcome lands
+        in status() so a broken layer is visible instead of surfacing later as
+        an unexplained crash.
+        """
+        if not IS_WINDOWS or not self.installed():
+            return
+        state: Dict[str, Any] = {"method": "pth", "verified": None, "detail": ""}
+        try:
+            for path in self._write_win_compat():
+                _LOGGER.info("refreshed Windows compat file %s", path)
+        except (OSError, RuntimeError) as e:
+            state["detail"] = f"写入失败：{e}"
+            _LOGGER.warning("could not refresh Windows compat files: %s", e)
+        ok, out = self._verify_win_compat()
+        if ok is False:
+            _LOGGER.warning("compat hook did not take effect (%s); patching vmmap.py", out)
+            patched = self._patch_installed_vmmap()
+            ok, out = self._verify_win_compat()
+            state["method"] = "vmmap-patch" if patched else "pth"
+            if patched:
+                _LOGGER.info("patched %s", patched)
+        state["verified"] = ok
+        state["detail"] = state["detail"] or out
+        self._win_compat = state
+
+    # ------------------------------------------------------------- timezone
+    def _local_timezone(self) -> str:
+        """The host's IANA zone name, asked of the venv's own tzlocal.
+
+        Miloco resolves its deploy timezone from ``TZ`` / ``/etc/timezone`` /
+        ``/etc/localtime`` — all Unix-only — and otherwise falls back to
+        ``Asia/Shanghai`` with a warning, so on Windows every timestamp it shows
+        would assume China regardless of where the machine is. tzlocal is
+        already installed in the venv (apscheduler depends on it, and on Windows
+        it pulls in `tzdata`, which is also what makes ZoneInfo work there at
+        all), so we can just ask it and pass the answer as ``MILOCO_TIMEZONE``.
+
+        Cached in install.json: this costs a subprocess, and a machine's zone
+        doesn't change while the app is open. Empty string means "couldn't tell",
+        in which case Miloco's own fallback stands.
+        """
+        if self._tz_cache is not None:
+            return self._tz_cache
+        info = self.install_info()
+        tz = str(info.get("local_timezone") or "").strip()
+        if not tz and _venv_python().exists():
+            try:
+                r = subprocess.run(
+                    [str(_venv_python()), "-c",
+                     # Validate through ZoneInfo as well: a name Miloco can't
+                     # load is worse than no name at all.
+                     "import tzlocal, zoneinfo;"
+                     "n = tzlocal.get_localzone_name() or '';"
+                     "zoneinfo.ZoneInfo(n); print(n)"],
+                    capture_output=True, text=True, timeout=30,
+                    creationflags=_no_window())
+                if r.returncode == 0 and (r.stdout or "").strip():
+                    tz = r.stdout.strip().splitlines()[-1].strip()
+            except (OSError, subprocess.SubprocessError):
+                tz = ""
+            if tz and info:
+                info["local_timezone"] = tz
+                try:
+                    INSTALL_INFO_PATH.write_text(
+                        json.dumps(info, ensure_ascii=False, indent=2), "utf-8")
+                except OSError:
+                    pass
+        self._tz_cache = tz
+        return tz
 
     def install_status(self, since: int = 0) -> Dict[str, Any]:
         """Snapshot of the install for the UI.
@@ -1249,6 +1534,23 @@ class MilocoController:
         if not self.installed():
             raise RuntimeError(f"尚未安装 Miloco（缺少 {_backend_exe()}），请先点击「安装 Miloco」。")
 
+        # Refresh the compat layer and resolve the host timezone before spawning,
+        # so an install made by an older build of this app gets both without the
+        # user having to reinstall. Both are off the event loop: writing files
+        # touches disk, and the timezone lookup runs the venv interpreter.
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, self._ensure_win_compat)
+        await loop.run_in_executor(None, self._local_timezone)
+        # A *proven* inert compat layer means the backend cannot import; say so
+        # here instead of spawning a process whose only output is the traceback
+        # the layer exists to prevent. `None` (probe couldn't run) is not proof,
+        # so it doesn't block.
+        if self._win_compat and self._win_compat.get("verified") is False:
+            raise RuntimeError(
+                "Windows 兼容层未生效，Miloco 会在导入阶段崩溃。"
+                f"虚拟环境 {VENV_DIR} 的校验输出：\n{self._win_compat.get('detail', '')}\n"
+                "请点击「重新安装 / 更新」重建虚拟环境；若仍然如此，请把这段信息反馈给我们。")
+
         # Seed our Mi credentials before first boot so Miloco comes up bound.
         seeded = self._seed_credentials()
 
@@ -1339,6 +1641,13 @@ class MilocoController:
         env.pop("PYTHONPATH", None)
         for key in [k for k in env if k.startswith("_PYI") or k == "_MEIPASS2"]:
             env.pop(key, None)
+        # Tell Miloco the real host timezone (see _local_timezone). Skipped when
+        # config.json sets one explicitly — env wins over config there, and the
+        # user's own choice must not be overridden by our detection.
+        if not str(self._read_config().get("timezone") or "").strip():
+            tz = self._tz_cache or ""
+            if tz:
+                env["MILOCO_TIMEZONE"] = tz
         self._close_log()
         try:
             self._proc_log = open(BACKEND_LOG_PATH, "w", encoding="utf-8", errors="replace")
@@ -1509,4 +1818,5 @@ class MilocoController:
             "has_credentials": self.has_credentials(),
             "miloco_home": str(MILOCO_HOME),
             "log_path": str(BACKEND_LOG_PATH),
+            "win_compat": self._win_compat,
         }

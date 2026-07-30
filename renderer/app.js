@@ -891,6 +891,14 @@ function renderPrereq(s) {
         ? `摄像头原生库应随本应用一起分发，缺失说明安装包不完整（也可用 <code>MIOT_CAMERA_DLL</code> 指向该 DLL）；` : ''}
       装好后点击「重新检测」。</div>`;
   }
+  // The Windows compat layer is what lets Miloco import at all (fcntl,
+  // os.sysconf). If the backend proved it inert, starting can only produce the
+  // traceback it exists to prevent — say so here rather than after the crash.
+  if (s.win_compat && s.win_compat.verified === false) {
+    html += `<div class="banner">Windows 兼容层未生效，Miloco 启动会在导入阶段崩溃。
+      请点击「重新安装 / 更新」重建虚拟环境。校验输出：
+      <code>${escapeHtml(String(s.win_compat.detail || '').slice(0, 300))}</code></div>`;
+  }
   if (p.warn.length && !s.web_built) {
     html += `<div class="hint" style="color:var(--red)">⚠ 未检测到 ${escapeHtml(p.warn.join('、'))}，
       安装时会跳过 Miloco 的 Web 控制台构建（HTTP API 仍可用，但本页无法内嵌控制台）。
