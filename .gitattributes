@@ -1,0 +1,4 @@
+# PowerShell 5.1 reads BOM-less scripts as ANSI and mis-parses here-strings in
+# LF-only files, so .ps1 must reach Windows with CRLF regardless of the platform
+# it was committed from.
+*.ps1 text eol=crlf
