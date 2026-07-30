@@ -777,7 +777,13 @@ async function xiaomiSpeak() {
 }
 
 // ===========================================================================
-// Miloco (Mi Home perceptive gateway) — Docker controller + web preview
+// Miloco (Mi Home perceptive gateway) — bare-metal installer + process + preview
+//
+// Driven by backend/miloco_controller.py, which installs Miloco *onto this
+// machine* (git checkout + pnpm web build + venv, plus the self-built Windows
+// camera DLL) and supervises it as a plain child process. There is no Docker
+// here any more: no image to build, no container to inspect — the equivalent
+// states are "已安装 / 未安装" and a pid.
 // ===========================================================================
 const MILOCO_MIRROR_PRESETS = {
   pip: [
@@ -788,22 +794,8 @@ const MILOCO_MIRROR_PRESETS = {
     { value: 'tencent', label: '腾讯云' },
     { value: 'custom', label: '自定义…' },
   ],
-  apt: [
-    { value: 'default', label: '官方 (deb.debian.org)' },
-    { value: 'aliyun', label: '阿里云' },
-    { value: 'tsinghua', label: '清华' },
-    { value: 'ustc', label: '中科大' },
-    { value: 'tencent', label: '腾讯云' },
-    { value: 'custom', label: '自定义…' },
-  ],
-  registry: [
-    { value: 'default', label: '官方 (docker.io)' },
-    { value: 'daocloud', label: 'DaoCloud' },
-    { value: 'custom', label: '自定义…' },
-  ],
-  // Building the web dashboard runs `pnpm install` inside the image, which
-  // hits the npm registry from the same restricted networks pip/apt/docker.io
-  // above need mirrors for.
+  // The dashboard build runs `pnpm install` against the npm registry, from the
+  // same restricted networks PyPI needs a mirror for.
   npm: [
     { value: 'default', label: '官方 (registry.npmjs.org)' },
     { value: 'npmmirror', label: 'npmmirror (淘宝)' },
@@ -818,10 +810,7 @@ function loadMirrorPrefs() {
     const raw = localStorage.getItem('miloco_mirror_prefs');
     if (raw) return JSON.parse(raw);
   } catch (e) { /* ignore corrupt/unavailable storage */ }
-  return {
-    pip: 'default', apt: 'default', registry: 'default', npm: 'default',
-    pipCustom: '', aptCustom: '', registryCustom: '', npmCustom: '',
-  };
+  return { pip: 'default', npm: 'default', pipCustom: '', npmCustom: '' };
 }
 
 function saveMirrorPrefs(prefs) {
@@ -835,17 +824,17 @@ function resolvedMirror(kind) {
 }
 
 let MILOCO = {
-  status: null, buildPoll: null, statusPoll: null,
-  building: false, showMirrors: false, mirrors: loadMirrorPrefs(),
-  lastBuildSteps: [], lastBuildLog: [],
-  // Absolute sequence of the next build-log line we haven't fetched yet, so
+  status: null, installPoll: null, statusPoll: null,
+  installing: false, showMirrors: false, mirrors: loadMirrorPrefs(),
+  lastSteps: [], lastLog: [],
+  // Absolute sequence of the next install-log line we haven't fetched yet, so
   // each poll appends rather than repainting a fixed-size tail.
-  buildSeq: 0,
+  logSeq: 0,
   // Set when polling itself fails. Previously these errors were swallowed,
-  // which made a dead poll look exactly like a build producing no output.
-  buildPollError: null,
-  // Outcome of the last finished build, kept on screen (a toast disappears).
-  lastBuildResult: null,
+  // which made a dead poll look exactly like an install producing no output.
+  pollError: null,
+  // Outcome of the last finished install, kept on screen (a toast disappears).
+  lastResult: null,
 };
 
 async function loadMiloco() {
@@ -873,25 +862,58 @@ async function refreshMilocoStatus() {
   } catch (e) { /* ignore transient */ }
 }
 
+// Host requirements for a bare-metal install. Python and git are hard blockers
+// (the backend refuses without them); on Windows so is the camera DLL, because
+// Miloco loads it during MIoTClient init and dies without it. Node/pnpm only
+// gates the web dashboard, so it's a warning — the HTTP API works either way.
+function milocoPrereq(s) {
+  const e = s.env || {};
+  const missing = [];
+  const warn = [];
+  if (!e.python) missing.push(`Python ≥ ${e.min_python || '3.11'}`);
+  if (!e.git) missing.push('Git');
+  if (s.platform === 'windows' && !e.camera_dll) missing.push('摄像头原生库 miot_camera_lite.dll');
+  if (!e.pnpm) warn.push('Node.js / pnpm');
+  return { missing, warn, ok: missing.length === 0 };
+}
+
+function renderPrereq(s) {
+  const p = milocoPrereq(s);
+  let html = '';
+  if (p.missing.length) {
+    html += `<div class="banner">缺少安装 Miloco 所需的组件：<strong>${escapeHtml(p.missing.join('、'))}</strong>。
+      ${!s.env || !s.env.python
+        ? `请安装 <a href="#" class="ml-link" data-url="https://www.python.org/downloads/windows/">Python 3.11+</a>
+           （安装时勾选 “Add python.exe to PATH”），或用环境变量 <code>MILOCO_PYTHON</code> 指定解释器路径；` : ''}
+      ${!s.env || !s.env.git
+        ? `请安装 <a href="#" class="ml-link" data-url="https://git-scm.com/download/win">Git for Windows</a>；` : ''}
+      ${s.platform === 'windows' && s.env && !s.env.camera_dll
+        ? `摄像头原生库应随本应用一起分发，缺失说明安装包不完整（也可用 <code>MIOT_CAMERA_DLL</code> 指向该 DLL）；` : ''}
+      装好后点击「重新检测」。</div>`;
+  }
+  if (p.warn.length && !s.web_built) {
+    html += `<div class="hint" style="color:var(--red)">⚠ 未检测到 ${escapeHtml(p.warn.join('、'))}，
+      安装时会跳过 Miloco 的 Web 控制台构建（HTTP API 仍可用，但本页无法内嵌控制台）。
+      建议先安装 <a href="#" class="ml-link" data-url="https://nodejs.org/">Node.js LTS</a>（自带 npx，
+      安装器会用它拉起 pnpm）。</div>`;
+  }
+  return html;
+}
+
 function renderMiloco() {
   const s = MILOCO.status;
   const wrap = $('#miloco-wrap');
-
-  if (!s.docker_available) {
-    wrap.innerHTML = `
-      <div class="miloco-panel">
-        <div class="banner">未检测到可用的 Docker。Miloco 需要通过 Docker 以 <code>--network host</code> 方式运行。
-          请安装并启动 Docker Desktop / Docker Engine 后重试。</div>
-        <p class="login-msg">Miloco 是小米官方的「感知家庭」网关
-          (<code>github.com/XiaoMi/xiaomi-miloco</code>)，运行后本应用会自动把当前登录的米家凭据注入给
-          Miloco，无需重新绑定账号。</p>
-      </div>`;
-    return;
-  }
+  const prereq = milocoPrereq(s);
 
   const stateLabel = s.running
-    ? (s.healthy ? '<span style="color:var(--green)">运行中 · 健康</span>' : '<span style="color:var(--primary)">运行中 · 启动中…</span>')
-    : (s.container_state ? `已停止（${escapeHtml(s.container_state)}）` : '未运行');
+    ? (s.healthy
+        ? `<span style="color:var(--green)">运行中 · 健康</span>${s.pid ? ` <span class="device-sub">(pid ${s.pid})</span>` : ''}`
+        : `<span style="color:var(--primary)">运行中 · 启动中…</span>${s.pid ? ` <span class="device-sub">(pid ${s.pid})</span>` : ''}`)
+    : (s.installed ? '已安装 · 未运行' : '未安装');
+
+  const installLabel = MILOCO.installing
+    ? '安装中…'
+    : (s.installed ? '重新安装 / 更新' : '安装 Miloco');
 
   const controls = `
     <div class="miloco-toolbar">
@@ -900,27 +922,23 @@ function renderMiloco() {
         <span>Miloco 状态：${stateLabel}</span>
       </div>
       <div class="miloco-actions">
-        ${!s.image_exists
-          ? `<button class="btn primary" id="ml-build" ${MILOCO.building ? 'disabled' : ''}>
-               ${MILOCO.building ? '构建中…' : '构建镜像'}</button>
-             <button class="btn" id="ml-mirrors-toggle">${MILOCO.showMirrors ? '收起镜像源' : '镜像源设置'}</button>`
-          : ''}
-        ${s.image_exists && !s.running
-          ? `<button class="btn primary" id="ml-start">启动 Miloco</button>` : ''}
         ${s.running
           ? `<button class="btn" id="ml-stop">停止</button>
-             <button class="btn" id="ml-open">在浏览器打开</button>` : ''}
+             <button class="btn" id="ml-open">在浏览器打开</button>`
+          : `${s.installed ? `<button class="btn primary" id="ml-start">启动 Miloco</button>` : ''}
+             <button class="btn ${s.installed ? '' : 'primary'}" id="ml-install"
+               ${MILOCO.installing || !prereq.ok ? 'disabled' : ''}>${installLabel}</button>
+             <button class="btn" id="ml-mirrors-toggle">${MILOCO.showMirrors ? '收起镜像源' : '镜像源设置'}</button>
+             <button class="btn" id="ml-recheck">重新检测</button>`}
         <button class="btn" id="ml-logs">查看日志</button>
       </div>
     </div>`;
 
-  const mirrors = !s.image_exists && MILOCO.showMirrors ? `
+  const mirrors = MILOCO.showMirrors && !s.running ? `
     <div class="miloco-mirrors">
       ${renderMirrorRow('pip', 'PyPI 镜像')}
-      ${renderMirrorRow('apt', 'APT 镜像')}
-      ${renderMirrorRow('registry', 'Docker 镜像仓库')}
       ${renderMirrorRow('npm', 'NPM 镜像（构建 Web 控制台用）')}
-      <div class="hint">仅影响下一次构建；选择会保存在本机，下次自动沿用。</div>
+      <div class="hint">仅影响下一次安装；选择会保存在本机，下次自动沿用。</div>
     </div>` : '';
 
   const credNote = s.has_credentials
@@ -944,45 +962,64 @@ function renderMiloco() {
       <div class="placeholder-icon">🏠</div>
       <p>Miloco 正在启动…（等待 <code>${escapeHtml(s.url)}/health</code> 就绪）</p>
     </div>`;
-  } else if (!s.image_exists) {
+  } else if (!s.installed) {
     body = `<div class="miloco-preview placeholder">
       <div class="placeholder-icon">📦</div>
-      <p>尚未构建 Miloco 镜像。点击「构建镜像」从官方源构建（首次较慢）。</p>
-      ${renderBuildPanel()}
+      <p>尚未安装 Miloco。点击「${escapeHtml(installLabel)}」把官方源码装到本机
+        <code>${escapeHtml(s.install_root || '')}</code>（无需 Docker / WSL；首次需下载数百 MB，较慢）。</p>
+      ${renderInstallPanel()}
     </div>`;
   } else {
     body = `<div class="miloco-preview placeholder">
       <div class="placeholder-icon">🏠</div>
-      <p>镜像已就绪。点击「启动 Miloco」以 <code>--network host</code> 方式运行，并自动注入米家凭据。</p>
-      ${renderContainerFailure(s)}
-      ${renderBuildPanel()}
+      <p>已安装完成。点击「启动 Miloco」在本机直接运行，并自动注入米家凭据。</p>
+      ${renderProcessFailure(s)}
+      ${renderInstallPanel()}
     </div>`;
   }
 
-  wrap.innerHTML = `<div class="miloco-panel">${controls}${mirrors}${credNote}${body}</div>`;
+  wrap.innerHTML = `<div class="miloco-panel">${controls}${renderPrereq(s)}${mirrors}${credNote}${renderInstallInfo(s)}${body}</div>`;
   bindMilocoEvents();
-  // Repaint whatever we already know immediately, so a re-render mid-build
+  // Repaint whatever we already know immediately, so a re-render mid-install
   // never blanks the log while waiting for the next poll tick.
-  renderBuildSteps(MILOCO.lastBuildSteps);
+  renderBuildSteps(MILOCO.lastSteps);
   appendBuildLog();
   renderBuildError();
-  if (MILOCO.building) pollMilocoBuild();
+  if (MILOCO.installing) pollMilocoInstall();
 }
 
-// The build progress pane. Rendered whenever a build is running *or* one has
-// finished this session, so the outcome (and its log) stays inspectable
+// What's actually installed, folded away — useful when something misbehaves
+// (which upstream commit, which interpreter, whether the dashboard got built).
+function renderInstallInfo(s) {
+  if (!s.installed) return '';
+  const i = s.install_info || {};
+  const rows = [
+    ['版本', i.versions || '(未知)'],
+    ['上游', `${i.ref || ''}${i.commit ? ' @ ' + i.commit : ''}`],
+    ['Python', `${i.python_version || ''} · ${i.python || ''}`],
+    ['安装目录', s.install_root],
+    ['状态目录', s.miloco_home],
+    ['Web 控制台', i.web_built ? '已构建' : '未构建（缺少 Node/pnpm 时会跳过）'],
+    ['进程日志', s.log_path],
+  ].map(([k, v]) => `<tr><td>${escapeHtml(k)}</td><td><code>${escapeHtml(String(v || ''))}</code></td></tr>`).join('');
+  return `<details class="build-log-details"><summary>安装信息</summary>
+    <table class="ml-diag">${rows}</table></details>`;
+}
+
+// The install progress pane. Rendered whenever an install is running *or* one
+// has finished this session, so the outcome (and its log) stays inspectable
 // instead of vanishing with the toast.
-function renderBuildPanel() {
-  const r = MILOCO.lastBuildResult;
-  if (!MILOCO.building && !r) return '';
+function renderInstallPanel() {
+  const r = MILOCO.lastResult;
+  if (!MILOCO.installing && !r) return '';
   let summary = '';
-  if (MILOCO.building) {
-    summary = `<div class="build-alert">⏳ 正在构建镜像…（首次构建通常需要数分钟）</div>`;
+  if (MILOCO.installing) {
+    summary = `<div class="build-alert">⏳ 正在安装 Miloco…（下载源码 + 构建控制台 + 安装依赖，通常需要数分钟）</div>`;
   } else if (r && r.ok) {
-    summary = `<div class="build-alert ok">✓ 镜像 <code>${escapeHtml(r.imageName || '')}</code> 构建成功${
+    summary = `<div class="build-alert ok">✓ Miloco 安装完成${
       r.elapsed != null ? `，耗时 ${r.elapsed.toFixed(1)}s` : ''}。</div>`;
   } else if (r) {
-    summary = `<div class="build-alert err">✗ 镜像构建失败${
+    summary = `<div class="build-alert err">✗ 安装失败${
       r.exitCode != null ? `（exit ${r.exitCode}）` : ''}：${escapeHtml(r.error || '未知错误')}</div>`;
   }
   const logPath = r && r.logPath
@@ -991,7 +1028,7 @@ function renderBuildPanel() {
     ${summary}
     <div class="build-alert err" id="ml-build-alert" style="display:none"></div>
     <div class="build-steps" id="ml-build-steps"></div>
-    <details class="build-log-details" ${MILOCO.building || (r && !r.ok) ? 'open' : ''}>
+    <details class="build-log-details" ${MILOCO.installing || (r && !r.ok) ? 'open' : ''}>
       <summary>原始日志</summary>
       <pre class="xm-code" id="ml-build-log" style="max-height:220px;overflow:auto"></pre>
     </details>
@@ -1023,11 +1060,11 @@ function renderTokenDiagnostics(s) {
   let verdict;
   if (s.preview_status === 503 || !s.has_server_token) {
     verdict = `Miloco 尚未生成 server.token（config.json 里没有可用的 token 字段），控制台暂时返回 503。` +
-      `通常在容器刚启动、还没写完配置时短暂出现，稍等几秒后「刷新」。`;
+      `通常在刚启动、还没写完配置时短暂出现，稍等几秒后「刷新」。`;
   } else if (s.preview_status === 404) {
-    verdict = `控制台返回 404 —— 该镜像里没有内置 Web 前端（只有后端 API）。` +
-      `如果是用旧版本构建的镜像，重新点击「构建镜像」用最新 Dockerfile 重建即可；` +
-      `如果是刚重建的，说明前端构建步骤失败了，请查看构建日志。`;
+    verdict = `控制台返回 404 —— 这次安装没有构建 Web 前端（只装了后端 API）。` +
+      `装好 Node.js / pnpm 后点击「重新安装 / 更新」即可补上；` +
+      `如果本机已有 Node，说明前端构建步骤失败了，请查看安装日志。`;
   } else {
     verdict = `控制台返回 HTTP ${s.preview_status == null ? '（无法连接）' : s.preview_status}。`;
   }
@@ -1036,19 +1073,20 @@ function renderTokenDiagnostics(s) {
       ✗ 无法打开 Miloco 控制台：${verdict}
     </div>
     <table class="ml-diag">${rows}</table>
-    <div class="hint">后端健康检查 <code>/health</code> 正常，说明容器本身在运行。</div>`;
+    <div class="hint">后端健康检查 <code>/health</code> 正常，说明进程本身在运行。</div>`;
 }
 
-// Explain a container that was started but isn't running, instead of silently
-// falling back to "未运行".
-function renderContainerFailure(s) {
-  if (!s.container_state || s.running) return '';
+// Explain a process that was started but isn't running any more. Nothing
+// restarts it automatically (unlike the old `docker run --restart
+// unless-stopped`), so the exit code plus the captured tail is the whole story.
+function renderProcessFailure(s) {
+  if (s.running || (s.exit_code == null && !s.start_error)) return '';
   const code = s.exit_code != null ? `（exit ${s.exit_code}）` : '';
   const detail = s.start_error
     ? `<pre class="xm-code" style="max-height:160px;overflow:auto;margin-top:8px">${escapeHtml(s.start_error)}</pre>`
     : '';
   return `<div class="build-alert err" style="max-width:560px">
-    ✗ 容器已停止${code}：<code>${escapeHtml(s.container_state)}</code>。点击「查看日志」了解详情。${detail}
+    ✗ Miloco 进程已退出${code}。点击「查看日志」了解详情（<code>${escapeHtml(s.log_path || '')}</code>）。${detail}
   </div>`;
 }
 
@@ -1071,9 +1109,10 @@ function renderBuildSteps(steps) {
   box.innerHTML = (steps || []).map((s) => {
     const running = s.status === 'running';
     const failed = s.status === 'error';
-    const icon = running ? '<span class="tool-spinner"></span>' : (failed ? '⚠️' : '✓');
-    const suffix = s.status === 'cached' ? 'cached' : (s.duration != null ? `${s.duration.toFixed(1)}s` : '');
-    return `<div class="tool-card build-step ${running ? 'running' : 'done'}${failed ? ' error' : ''}">
+    const skipped = s.status === 'skipped';
+    const icon = running ? '<span class="tool-spinner"></span>' : (failed ? '⚠️' : (skipped ? '–' : '✓'));
+    const suffix = skipped ? '已跳过' : (s.duration != null ? `${s.duration.toFixed(1)}s` : '');
+    return `<div class="tool-card build-step ${running ? 'running' : 'done'}${failed ? ' error' : ''}${skipped ? ' skipped' : ''}">
       <div class="tool-head">${icon} <span class="tool-name">${escapeHtml(s.title || ('#' + s.id))}</span>${running ? '…' : ' ' + suffix}</div>
       ${s.error ? `<div class="tool-result">${escapeHtml(s.error)}</div>` : ''}
     </div>`;
@@ -1083,12 +1122,16 @@ function renderBuildSteps(steps) {
 
 function bindMilocoEvents() {
   const b = (id, fn) => { const el = $('#' + id); if (el) el.addEventListener('click', fn); };
-  b('ml-build', milocoBuild);
+  b('ml-install', milocoInstall);
   b('ml-start', milocoStart);
   b('ml-stop', milocoStop);
   b('ml-logs', milocoShowLogs);
+  b('ml-recheck', loadMiloco);
   b('ml-mirrors-toggle', () => { MILOCO.showMirrors = !MILOCO.showMirrors; renderMiloco(); });
   b('ml-open', () => window.miot.openExternal(MILOCO.status.preview_url));
+  $$('#miloco-wrap .ml-link').forEach((a) => {
+    a.addEventListener('click', (ev) => { ev.preventDefault(); window.miot.openExternal(a.dataset.url); });
+  });
   $$('#miloco-wrap .ml-mirror-select').forEach((sel) => {
     sel.addEventListener('change', () => {
       MILOCO.mirrors[sel.dataset.kind] = sel.value;
@@ -1104,74 +1147,72 @@ function bindMilocoEvents() {
   });
 }
 
-async function milocoBuild() {
+async function milocoInstall() {
   try {
-    await apiPost('/api/miloco/build', {
+    await apiPost('/api/miloco/install', {
       pip_mirror: resolvedMirror('pip'),
-      apt_mirror: resolvedMirror('apt'),
-      registry_mirror: resolvedMirror('registry'),
       npm_mirror: resolvedMirror('npm'),
     });
-    toast('开始构建镜像…', 'ok');
-    MILOCO.building = true;
-    MILOCO.lastBuildSteps = [];
-    MILOCO.lastBuildLog = [];
-    MILOCO.buildSeq = 0;
-    MILOCO.buildPollError = null;
-    MILOCO.lastBuildResult = null;
+    toast('开始安装 Miloco…', 'ok');
+    MILOCO.installing = true;
+    MILOCO.lastSteps = [];
+    MILOCO.lastLog = [];
+    MILOCO.logSeq = 0;
+    MILOCO.pollError = null;
+    MILOCO.lastResult = null;
     renderMiloco();  // renders the panel and starts the poll
-  } catch (e) { toast('构建失败：' + e.message, 'err'); }
+  } catch (e) { toast('安装失败：' + e.message, 'err'); }
 }
 
-async function pollMilocoBuild() {
+async function pollMilocoInstall() {
   // Don't restart a poll that's already running: renderMiloco() also calls
-  // this, so a re-render mid-build must not reset the interval (repeated
+  // this, so a re-render mid-install must not reset the interval (repeated
   // resets faster than the interval would starve it entirely).
-  if (MILOCO.buildPoll) return;
+  if (MILOCO.installPoll) return;
   const tick = async () => {
     let st;
     try {
-      st = await api('/api/miloco/build/status?since=' + MILOCO.buildSeq);
-      MILOCO.buildPollError = null;
+      st = await api('/api/miloco/install/status?since=' + MILOCO.logSeq);
+      MILOCO.pollError = null;
     } catch (e) {
       // Surface it. A silently-swallowed poll error is indistinguishable from
-      // a build that simply hasn't printed anything yet.
-      MILOCO.buildPollError = e.message;
+      // an install that simply hasn't printed anything yet.
+      MILOCO.pollError = e.message;
       renderBuildError();
       return;
     }
-    MILOCO.lastBuildSteps = st.steps || [];
+    MILOCO.lastSteps = st.steps || [];
     if (Array.isArray(st.lines) && st.lines.length) {
-      MILOCO.lastBuildLog = MILOCO.lastBuildLog.concat(st.lines);
-      if (MILOCO.lastBuildLog.length > 5000) {
-        MILOCO.lastBuildLog.splice(0, MILOCO.lastBuildLog.length - 5000);
+      MILOCO.lastLog = MILOCO.lastLog.concat(st.lines);
+      if (MILOCO.lastLog.length > 5000) {
+        MILOCO.lastLog.splice(0, MILOCO.lastLog.length - 5000);
       }
     }
-    if (typeof st.next_seq === 'number') MILOCO.buildSeq = st.next_seq;
+    if (typeof st.next_seq === 'number') MILOCO.logSeq = st.next_seq;
     appendBuildLog();
-    renderBuildSteps(MILOCO.lastBuildSteps);
+    renderBuildSteps(MILOCO.lastSteps);
     renderBuildError();
-    if (!st.building) {
-      clearInterval(MILOCO.buildPoll);
-      MILOCO.buildPoll = null;
-      MILOCO.building = false;
-      MILOCO.lastBuildResult = {
+    if (!st.installing) {
+      clearInterval(MILOCO.installPoll);
+      MILOCO.installPoll = null;
+      MILOCO.installing = false;
+      MILOCO.lastResult = {
         ok: !st.error, error: st.error, exitCode: st.exit_code,
-        elapsed: st.elapsed, logPath: st.log_path, imageName: st.image_name,
+        elapsed: st.elapsed, logPath: st.log_path,
       };
-      if (st.error) toast('镜像构建失败：' + st.error, 'err');
-      else toast('镜像构建完成', 'ok');
+      if (st.error) toast('安装失败：' + st.error, 'err');
+      else toast('Miloco 安装完成', 'ok');
       loadMiloco();
     }
   };
-  MILOCO.buildPoll = setInterval(tick, 1500);
+  MILOCO.installPoll = setInterval(tick, 1500);
   tick();  // paint immediately instead of waiting out the first interval
 }
 
 function appendBuildLog() {
   const box = $('#ml-build-log');
   if (!box) return;
-  const text = MILOCO.lastBuildLog.join('\n');
+  const text = MILOCO.lastLog.join('\n');
   if (box.textContent === text) return;
   // Only autoscroll when already pinned to the bottom, so scrolling back to
   // read an error isn't yanked away by the next line.
@@ -1183,10 +1224,10 @@ function appendBuildLog() {
 function renderBuildError() {
   const box = $('#ml-build-alert');
   if (!box) return;
-  if (MILOCO.buildPollError) {
+  if (MILOCO.pollError) {
     box.style.display = 'block';
     box.className = 'build-alert err';
-    box.textContent = '⚠ 无法获取构建进度：' + MILOCO.buildPollError + '（构建可能仍在后台进行）';
+    box.textContent = '⚠ 无法获取安装进度：' + MILOCO.pollError + '（安装可能仍在后台进行）';
   } else {
     box.style.display = 'none';
     box.textContent = '';

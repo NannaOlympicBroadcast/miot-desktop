@@ -43,6 +43,20 @@ for pkg in [
     except Exception as e:  # pragma: no cover
         print('collect_all skip', pkg, e)
 
+# The self-built Windows camera P2P library (see vendor/miot_kit/NOTICE.md).
+# `miot.camera._load_dynamic_lib()` CDLLs it from a hardcoded package-relative
+# path — <miot>/libs/windows/x86_64/miot_camera_lite.dll — which for a frozen
+# build resolves under sys._MEIPASS, so it has to land at exactly that path.
+# collect_all('miot') above already sweeps it up as a data file; this entry is
+# explicit so a change in PyInstaller's data-collection heuristics can't
+# silently drop it (and so `datas`, not `binaries`, keeps it verbatim instead
+# of putting it through binary dependency analysis + relocation).
+_CAMERA_DLL = os.path.join(VENDOR, 'miot', 'libs', 'windows', 'x86_64', 'miot_camera_lite.dll')
+if os.path.exists(_CAMERA_DLL):
+    datas += [(_CAMERA_DLL, os.path.join('miot', 'libs', 'windows', 'x86_64'))]
+else:  # pragma: no cover
+    print('camera dll missing, Windows live video will degrade:', _CAMERA_DLL)
+
 a = Analysis(
     [os.path.join(ROOT, 'backend', 'server.py')],
     pathex=[VENDOR, os.path.join(ROOT, 'backend')],

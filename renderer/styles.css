@@ -218,6 +218,12 @@ select:focus, .text-input:focus { border-color: var(--primary); }
 .ml-diag td { padding: 4px 8px; border-bottom: 1px solid var(--border); vertical-align: top; }
 .ml-diag td:first-child { color: var(--text-soft); white-space: nowrap; width: 96px; }
 .ml-diag code { word-break: break-all; }
+/* Prerequisite links (Python / Git / Node downloads) — opened in the system
+   browser via openExternal, since the app itself has no navigation. */
+.ml-link { color: inherit; text-decoration: underline; cursor: pointer; }
+/* A step the installer deliberately didn't run (e.g. no Node -> no web build):
+   neither success nor failure, so it must not read as a green tick. */
+.build-step.skipped .tool-head { color: var(--text-soft); }
 
 /* ---------------- SSR agent tab ---------------- */
 .agent-wrap { flex: 1; overflow: hidden; width: 100%; display: flex; }
