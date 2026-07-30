@@ -359,6 +359,13 @@ def _backend_exe() -> Path:
     return _venv_bin("miloco-backend")
 
 
+def _cli_exe() -> Path:
+    """Miloco's own CLI. Not a convenience: ``ssr.integrations.miloco`` reaches
+    almost all of Miloco through it (device catalog, home profile, notify push),
+    so the SSR agent is blind without it."""
+    return _venv_bin("miloco-cli")
+
+
 def _site_packages() -> Optional[Path]:
     """The venv's site-packages, without paying for a subprocess.
 
@@ -1132,6 +1139,17 @@ class MilocoController:
         if code == 0:
             code = await self._stream([vpy, "-m", "pip", "install", str(SRC_DIR / "backend" / "miloco")],
                                       env=pip_env)
+        if code == 0:
+            # miloco-cli too: it is the interface `ssr.integrations.miloco`
+            # drives Miloco through (device catalog / home profile / notify
+            # push), so without it the SSR agent has no Miloco tools and no
+            # device context — it can only guess. Its `service` group shells out
+            # to supervisord (Unix-only) and stays unusable on Windows, which is
+            # fine: this app supervises the backend process itself. Nothing in
+            # the package imports `supervisor`, and its one `import fcntl` is
+            # covered by the compat layer in this same venv.
+            code = await self._stream([vpy, "-m", "pip", "install", str(SRC_DIR / "cli")],
+                                      env=pip_env)
         if code != 0:
             self._fail("7", f"安装依赖失败（exit {code}）。网络受限时可在「镜像源设置」里选择 PyPI 镜像后重试。", code)
             return
@@ -1394,6 +1412,60 @@ class MilocoController:
         state["detail"] = state["detail"] or out
         self._win_compat = state
 
+    # ------------------------------------------------- SSR agent integration
+    def export_integration_env(self) -> Dict[str, str]:
+        """Publish this install into *our own* process environment.
+
+        ``ssr.integrations.miloco`` (the SSR agent's Miloco tools and its
+        per-turn context blocks) resolves everything through
+        ``MilocoConfig.from_env()`` plus a ``miloco-cli`` on PATH. Neither
+        matches a bare-metal install by default:
+
+        * ``MILOCO_HOME`` defaults to ``~/.openclaw/miloco``; ours lives beside
+          the miot cache, so the agent read an empty config — no server token,
+          no home profile, no device catalog.
+        * ``miloco-cli`` is installed inside Miloco's venv, which is not on this
+          process's PATH, so every tool call and every context block silently
+          degraded to "unavailable".
+
+        The net effect was an agent that had been *told* about Miloco's tools by
+        its persona but could not call any of them — so it answered device
+        questions by inventing them. Exporting these makes both the dedicated
+        tools and `miloco-cli ...` in the agent's shell tool work.
+
+        Returns what was set, for status/diagnostics. Safe to call repeatedly.
+        """
+        env: Dict[str, str] = {
+            "MILOCO_HOME": str(MILOCO_HOME),
+            "MILOCO_SERVER_URL": MILOCO_URL,
+        }
+        token = self.server_token()
+        if token:
+            env["MILOCO_SERVER_TOKEN"] = token
+        cli = _cli_exe()
+        if cli.exists():
+            env["MILOCO_CLI_BIN"] = str(cli)
+        os.environ.update(env)
+        if cli.exists():
+            # PATH as well as MILOCO_CLI_BIN: the dedicated tools honour the env
+            # var, but the agent reaches the rest of Miloco by running
+            # `miloco-cli ...` through its shell tool, which only sees PATH.
+            scripts = str(cli.parent)
+            parts = os.environ.get("PATH", "").split(os.pathsep)
+            if scripts not in parts:
+                os.environ["PATH"] = os.pathsep.join([scripts, *parts])
+        return env
+
+    def integration_env_status(self) -> Dict[str, Any]:
+        """What the SSR agent will see when it looks for Miloco."""
+        cli = _cli_exe()
+        return {
+            "cli_path": str(cli) if cli.exists() else None,
+            "cli_installed": cli.exists(),
+            "miloco_home_env": os.environ.get("MILOCO_HOME"),
+            "server_token_exported": bool(os.environ.get("MILOCO_SERVER_TOKEN")),
+        }
+
     # ------------------------------------------------------------- timezone
     def _local_timezone(self) -> str:
         """The host's IANA zone name, asked of the venv's own tzlocal.
@@ -1601,6 +1673,10 @@ class MilocoController:
                 _LOGGER.warning(
                     "miloco did not write %s within the wait window; agent "
                     "webhook not seeded", self._config_path())
+
+        # Now that config.json (and therefore the server token) exists, hand the
+        # SSR agent everything it needs to find this Miloco.
+        self.export_integration_env()
 
         status = await self.status()
         status["seeded_credentials"] = seeded
@@ -1819,4 +1895,5 @@ class MilocoController:
             "miloco_home": str(MILOCO_HOME),
             "log_path": str(BACKEND_LOG_PATH),
             "win_compat": self._win_compat,
+            "integration": self.integration_env_status(),
         }

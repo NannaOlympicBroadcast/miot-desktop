@@ -652,7 +652,13 @@ async def h_miloco_install_status(request: web.Request) -> web.Response:
 
 async def h_miloco_start(request: web.Request) -> web.Response:
     try:
-        return _json(await MILOCO.start())
+        status = await MILOCO.start()
+        # Drop the cached agent: it was built (if at all) before Miloco had a
+        # server token or a reachable CLI, so its Miloco tools and its device
+        # catalog / home profile context blocks all resolved to nothing. The
+        # next turn rebuilds against a running Miloco.
+        AGENT.reset_agent()
+        return _json(status)
     except Exception as err:  # pylint: disable=broad-except
         return _err(str(err))
 
@@ -777,6 +783,15 @@ def _jsonable(event: dict) -> dict:
 
 
 async def on_startup(app: web.Application) -> None:
+    # Point ssr.integrations.miloco at *this* Miloco install before anything
+    # builds the agent: it resolves MILOCO_HOME/token from the environment and
+    # runs miloco-cli off PATH, neither of which matches a bare-metal install by
+    # default. Done here as well as in MILOCO.start() so a Miloco left running
+    # by a previous session is picked up too.
+    try:
+        MILOCO.export_integration_env()
+    except Exception as err:  # pylint: disable=broad-except
+        _LOGGER.warning("miloco integration env not exported: %s", err)
     try:
         await BE.init()
     except Exception as err:  # pylint: disable=broad-except
