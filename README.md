@@ -184,6 +184,32 @@ site-packages 写入两样东西（**不改上游源码**，因为改了会被�
 `.pth` 的作用是让 site.py 在**解释器启动时**就执行补丁，早于任何 miloco 模块导入——这也是唯一
 可行的时机。补丁只在有真实 Windows 答案时回答，绝不把失败伪装成成功。
 
+**写了 ≠ 生效**，所以写完还会校验：用虚拟环境自己跑一次
+`import fcntl, miloco.node_monitor.vmmap`。
+
+- 校验通过 → 正常启动。
+- 校验失败（说明该环境没有加载 `.pth` 启动钩子）→ 自动回退：直接把已安装的
+  `vmmap.py` 那一行改成 `os.sysconf(...) if hasattr(os, "sysconf") else mmap.PAGESIZE`，
+  清掉过期的 `__pycache__` 后再校验一次。（这是兜底而非首选：改动会被下次更新覆盖，
+  所以优先用 `.pth`。若上游改了那一行，则**不做**盲目替换，让真实错误暴露出来。）
+- 两次都失败 → 「启动」直接报错并说明原因，而不是启动一个必然崩溃的进程；界面也会显示
+  横幅提示。
+
+### 已经装好、但还在旧版应用上的修复办法
+
+兼容层由应用后端写入，所以**必须先更新应用本身**（开发模式 `git pull` 后重启应用即可；
+打包版需要重新构建 exe）。如果暂时不方便更新，可以直接在 PowerShell 里跑仓库里的独立脚本，
+它不依赖应用、只操作已安装的虚拟环境：
+
+```powershell
+.\scripts\repair_miloco_win.ps1
+# 或指定虚拟环境位置
+.\scripts\repair_miloco_win.ps1 -VenvDir "D:\path\to\miloco_runtime\venv"
+```
+
+脚本会写入同样的两个补丁文件，然后用虚拟环境实际 `import miloco.main` 验证，成功后回到应用点
+「启动 Miloco」即可。
+
 内存 region 采集（`/proc/self/smaps`）在 Windows 上不可用，Miloco 自己会在启动探测时捕获并标记
 `memory regions not available`，其余监控正常——这与容器行为一致，属于预期降级。
 
@@ -305,6 +331,7 @@ miot-desktop/
 │   ├── ssr_agent_bridge.py  # 内置 SSR 智能体：模型配置 + 聊天(图片/文件) + Miloco→总线
 │   ├── requirements.txt
 │   └── miot-backend.spec   # PyInstaller 打包脚本
+├── scripts/repair_miloco_win.ps1  # 独立修复脚本：给已装好的 Miloco 虚拟环境补 Windows 兼容层
 ├── renderer/
 │   ├── index.html / styles.css / app.js   # 主界面：设备、Miloco、SSR 助手、小爱音箱、设置
 │   └── quick.html / quick.js              # 托盘快捷控制面板

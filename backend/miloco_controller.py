@@ -537,6 +537,9 @@ class MilocoController:
         # Host IANA timezone; "" means "asked and couldn't tell", None means
         # "not asked yet" (see _local_timezone).
         self._tz_cache: Optional[str] = None
+        # Outcome of the last Windows compat-layer refresh (see
+        # _ensure_win_compat); surfaced in status() so an inert shim is visible.
+        self._win_compat: Optional[Dict[str, Any]] = None
 
     # ------------------------------------------------------------ log io
     def _log_path(self) -> Path:
@@ -1143,6 +1146,16 @@ class MilocoController:
             except (OSError, RuntimeError) as e:
                 self._fail("8", f"写入 Windows 兼容层失败：{e}")
                 return
+            # Same write -> verify -> patch-as-fallback path start() uses, so a
+            # fresh install can't hand over an inert layer either.
+            await asyncio.get_event_loop().run_in_executor(None, self._ensure_win_compat)
+            state = self._win_compat or {}
+            self._append(f"  兼容层校验：verified={state.get('verified')} "
+                         f"method={state.get('method')} {state.get('detail', '')}")
+            if state.get("verified") is False:
+                self._fail("8", "Windows 兼容层未生效（虚拟环境不会加载 .pth 启动钩子，"
+                                f"且无法回退修补源码）：{state.get('detail', '')}")
+                return
         if not _backend_exe().exists():
             self._fail("8", f"安装完成但未生成 {_backend_exe()}，请查看上面的安装日志。")
             return
@@ -1288,20 +1301,98 @@ class MilocoController:
             written.append(target)
         return written
 
-    def _ensure_win_compat(self) -> None:
-        """Best-effort refresh of the compat layer before a start.
+    def _verify_win_compat(self) -> Tuple[Optional[bool], str]:
+        """Ask the venv itself whether the layer is actually in effect.
 
-        Deliberately non-fatal: if it can't be written the spawn below fails
-        with the real traceback in the log, which is more informative than a
-        pre-emptive error here.
+        Writing the files is not proof: a ``.pth`` only runs if site.py
+        processes that directory, so a layout or interpreter we didn't
+        anticipate would leave the shim inert — and the backend would then die
+        with exactly the traceback the shim exists to prevent. This runs the
+        same two operations the import chain needs.
+
+        Returns (True | False | None, output): None means the probe itself
+        couldn't run (no interpreter, timeout), which proves nothing.
+
+        It imports the two modules that actually broke rather than asserting
+        ``os.sysconf`` exists — the source-patch fallback below fixes the import
+        *without* adding ``os.sysconf``, so probing for the attribute would
+        report failure on a system that is, in fact, fine.
+        """
+        py = _venv_python()
+        if not py.exists():
+            return None, f"{py} 不存在"
+        try:
+            r = subprocess.run(
+                [str(py), "-c",
+                 "import fcntl, miloco.node_monitor.vmmap; print('compat ok')"],
+                capture_output=True, text=True, timeout=60, creationflags=_no_window())
+        except (OSError, subprocess.SubprocessError) as e:
+            return None, str(e)
+        out = ((r.stdout or "") + (r.stderr or "")).strip()
+        return r.returncode == 0, out
+
+    # The single module-scope POSIX call the compat layer exists for. Patching
+    # installed source is the fallback, not the plan: it has to be redone after
+    # every update, which is why the .pth comes first.
+    _VMMAP_NEEDLE = 'os.sysconf("SC_PAGESIZE")'
+    _VMMAP_REPLACEMENT = ('(os.sysconf("SC_PAGESIZE") if hasattr(os, "sysconf")'
+                          ' else __import__("mmap").PAGESIZE)')
+
+    def _patch_installed_vmmap(self) -> Optional[Path]:
+        """Last-resort: make the installed vmmap.py itself Windows-safe.
+
+        Only reached when the startup hook demonstrably didn't take effect.
+        Returns the patched file, or None if there was nothing to patch (either
+        already done, or upstream changed the line — in which case the error
+        that follows is a real one worth reporting rather than papering over).
+        """
+        site = _site_packages()
+        if site is None:
+            return None
+        target = site / "miloco" / "node_monitor" / "vmmap.py"
+        try:
+            text = target.read_text("utf-8")
+        except OSError:
+            return None
+        if self._VMMAP_REPLACEMENT in text or self._VMMAP_NEEDLE not in text:
+            return None
+        try:
+            target.write_text(text.replace(self._VMMAP_NEEDLE, self._VMMAP_REPLACEMENT, 1), "utf-8")
+            # Drop the stale bytecode, or the edit is ignored until mtime wins.
+            for pyc in (target.parent / "__pycache__").glob("vmmap.*.pyc"):
+                pyc.unlink(missing_ok=True)
+        except OSError:
+            return None
+        return target
+
+    def _ensure_win_compat(self) -> None:
+        """Refresh the compat layer before a start, then prove it works.
+
+        Order: write the files -> verify -> patch installed source if the
+        verification says the hook is inert -> verify again. The outcome lands
+        in status() so a broken layer is visible instead of surfacing later as
+        an unexplained crash.
         """
         if not IS_WINDOWS or not self.installed():
             return
+        state: Dict[str, Any] = {"method": "pth", "verified": None, "detail": ""}
         try:
             for path in self._write_win_compat():
                 _LOGGER.info("refreshed Windows compat file %s", path)
         except (OSError, RuntimeError) as e:
+            state["detail"] = f"写入失败：{e}"
             _LOGGER.warning("could not refresh Windows compat files: %s", e)
+        ok, out = self._verify_win_compat()
+        if ok is False:
+            _LOGGER.warning("compat hook did not take effect (%s); patching vmmap.py", out)
+            patched = self._patch_installed_vmmap()
+            ok, out = self._verify_win_compat()
+            state["method"] = "vmmap-patch" if patched else "pth"
+            if patched:
+                _LOGGER.info("patched %s", patched)
+        state["verified"] = ok
+        state["detail"] = state["detail"] or out
+        self._win_compat = state
 
     # ------------------------------------------------------------- timezone
     def _local_timezone(self) -> str:
@@ -1450,6 +1541,15 @@ class MilocoController:
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(None, self._ensure_win_compat)
         await loop.run_in_executor(None, self._local_timezone)
+        # A *proven* inert compat layer means the backend cannot import; say so
+        # here instead of spawning a process whose only output is the traceback
+        # the layer exists to prevent. `None` (probe couldn't run) is not proof,
+        # so it doesn't block.
+        if self._win_compat and self._win_compat.get("verified") is False:
+            raise RuntimeError(
+                "Windows 兼容层未生效，Miloco 会在导入阶段崩溃。"
+                f"虚拟环境 {VENV_DIR} 的校验输出：\n{self._win_compat.get('detail', '')}\n"
+                "请点击「重新安装 / 更新」重建虚拟环境；若仍然如此，请把这段信息反馈给我们。")
 
         # Seed our Mi credentials before first boot so Miloco comes up bound.
         seeded = self._seed_credentials()
@@ -1718,4 +1818,5 @@ class MilocoController:
             "has_credentials": self.has_credentials(),
             "miloco_home": str(MILOCO_HOME),
             "log_path": str(BACKEND_LOG_PATH),
+            "win_compat": self._win_compat,
         }
