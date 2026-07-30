@@ -44,14 +44,19 @@ logging.basicConfig(level=logging.WARNING)
 _LOGGER = logging.getLogger("miot_desktop")
 
 # ---------------------------------------------------------------------------
-# Camera native library detection + Windows monkey patch
+# Camera native library detection + no-op fallback
 #
-# The bundled miot_kit ships the camera P2P native lib only for linux/darwin.
-# On Windows the lib is absent, so loading it would crash client init. We
-# detect whether the real lib exists; if not we patch the loader with a no-op
-# fake (same approach the upstream helper scripts use) so the rest of the
-# client still initialises. Live video decode is only possible when the real
-# lib is present.
+# `miot.camera` CDLLs a per-platform P2P library from <miot>/libs/<os>/<arch>/,
+# and MIoTClient.init_async constructs MIoTCamera, so a missing library crashes
+# client init outright. Upstream only builds it for linux/darwin; this repo
+# vendors a self-built windows/x86_64 DLL (see vendor/miot_kit/NOTICE.md), which
+# is also what makes the bare-metal Windows Miloco deployment possible — see
+# miloco_controller.py.
+#
+# Any platform/arch still without a library (windows/arm64, macOS here, …) gets
+# the loader patched with a no-op fake (the same approach the upstream helper
+# scripts use) so the rest of the client initialises; live video decode then
+# stays unavailable until a real library is dropped in.
 # ---------------------------------------------------------------------------
 
 def _native_lib_path() -> Optional[Path]:
@@ -229,7 +234,7 @@ _AUTH: Dict[str, Any] = {"client": None, "uuid": None, "state": None}
 # XiaoAI ASR/TTS bridge (separate Mi passport credential — see xiaomi_asr_bridge.py).
 ASR = xiaomi_asr_bridge.XiaomiAsrBridge()
 
-# Miloco Docker controller (Mi Home perceptive gateway — see miloco_controller.py).
+# Miloco controller: installs/runs the gateway natively on this host (see miloco_controller.py).
 MILOCO = miloco_controller.MilocoController()
 
 # SSR agent bridge (chat assistant + Miloco→bus — see ssr_agent_bridge.py).
@@ -603,7 +608,7 @@ async def h_xiaomi_speak(request: web.Request) -> web.Response:
 
 
 # ---------------------------------------------------------------------------
-# Miloco Docker controller handlers
+# Miloco bare-metal controller handlers
 # ---------------------------------------------------------------------------
 async def h_miloco_status(request: web.Request) -> web.Response:
     try:
@@ -612,36 +617,35 @@ async def h_miloco_status(request: web.Request) -> web.Response:
         return _err(str(err))
 
 
-async def h_miloco_build(request: web.Request) -> web.Response:
-    """Body (all optional): {pip_mirror, apt_mirror, registry_mirror, npm_mirror}
-    — each either a preset name (see MilocoController's PIP_MIRRORS/APT_MIRRORS/
-    REGISTRY_MIRRORS/NPM_MIRRORS) or a raw URL/host/prefix; "default" (or
-    omitted) keeps the corresponding Dockerfile ARG at its upstream default."""
+async def h_miloco_install(request: web.Request) -> web.Response:
+    """Body (all optional): {pip_mirror, npm_mirror, ref} — the mirrors are
+    either a preset name (see MilocoController's PIP_MIRRORS/NPM_MIRRORS) or a
+    raw index/registry URL, "default" (or omitted) keeping the tool's own
+    default; `ref` is the upstream branch/tag/commit to install."""
     try:
         body = await request.json()
     except (json.JSONDecodeError, TypeError):
         body = {}
     try:
-        await MILOCO.build_image(
+        await MILOCO.install(
             pip_mirror=str(body.get("pip_mirror") or "default"),
-            apt_mirror=str(body.get("apt_mirror") or "default"),
-            registry_mirror=str(body.get("registry_mirror") or "default"),
             npm_mirror=str(body.get("npm_mirror") or "default"),
+            ref=(str(body.get("ref")).strip() if body.get("ref") else None),
         )
-        return _json(MILOCO.build_status())
+        return _json(MILOCO.install_status())
     except Exception as err:  # pylint: disable=broad-except
         return _err(str(err))
 
 
-async def h_miloco_build_status(request: web.Request) -> web.Response:
-    """Query: ?since=<seq> — return only build log lines from that sequence on,
-    so the client appends incrementally."""
+async def h_miloco_install_status(request: web.Request) -> web.Response:
+    """Query: ?since=<seq> — return only install log lines from that sequence
+    on, so the client appends incrementally."""
     try:
         try:
             since = int(request.query.get("since", "0"))
         except ValueError:
             since = 0
-        return _json(MILOCO.build_status(since=since))
+        return _json(MILOCO.install_status(since=since))
     except Exception as err:  # pylint: disable=broad-except
         return _err(str(err))
 
@@ -811,8 +815,8 @@ def build_app() -> web.Application:
     app.router.add_get("/api/xiaomi/bridge/status", h_xiaomi_bridge_status)
     app.router.add_post("/api/xiaomi/speak", h_xiaomi_speak)
     app.router.add_get("/api/miloco/status", h_miloco_status)
-    app.router.add_post("/api/miloco/build", h_miloco_build)
-    app.router.add_get("/api/miloco/build/status", h_miloco_build_status)
+    app.router.add_post("/api/miloco/install", h_miloco_install)
+    app.router.add_get("/api/miloco/install/status", h_miloco_install_status)
     app.router.add_post("/api/miloco/start", h_miloco_start)
     app.router.add_post("/api/miloco/stop", h_miloco_stop)
     app.router.add_get("/api/miloco/logs", h_miloco_logs)
