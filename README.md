@@ -170,7 +170,7 @@ npm start          # 启动应用
 网络受限时可在「镜像源设置」里选 PyPI / NPM 镜像（选择保存在本机，下次沿用）。首次安装需要
 下载数百 MB（源码含 79 MB 感知模型 + 依赖 wheel），通常几分钟。
 
-> 第 8 步为什么要真的 import 一遍：Miloco 至今遇到的每个 Windows 不兼容点都发生在
+> 第 9 步为什么要真的 import 一遍：Miloco 至今遇到的每个 Windows 不兼容点都发生在
 > **导入期**（见下），而不是运行期。把 `import miloco.main` 放进安装校验，等于把
 > 「安装成功、一启动就崩」变成「安装失败并附上 traceback」。
 
@@ -294,6 +294,12 @@ Agent（后端 `ssr_agent_bridge.py`）。相比早期基于完整 `ssr-agent`�
    `miloco_habit_suggest` 四个工具（上一条的 `apply_smart_home_scope` 只提供提示词素材——它告诉
    模型这些工具存在，却不提供工具本身；只做前者的话，小模型会“知道有 `miloco_im_push`”，然后用
    `run_command echo` 假装查询并编造结果）。
+   装载后还会**验证**：`ToolKit` 解析 `agent_tools` 的代码包在 `except Exception: continue` 里，
+   任何失败（运行时版本较旧不认 `agent_tools`、导入出错、配置出错）都会被**静默**丢弃——而人设
+   照旧告诉模型这些工具存在，于是就出现「发现了工具定义，但是无法调用」。因此后端在建好助手后会
+   检查这四个工具是否真的在 `toolkit.callables()` 里；不在就自己再装一次以拿到被吞掉的异常，
+   并在可行时直接挂到该 toolkit 实例上（`callables()` 是声明、分发、上下文三者共同的来源，
+   补这一处即可全覆盖）。装载方式与失败原因都会出现在「SSR 助手」标签页顶部。
    同时后端会把 `MILOCO_HOME` / `MILOCO_SERVER_URL` / `MILOCO_SERVER_TOKEN` / `MILOCO_CLI_BIN`
    导出到自身进程，并把 Miloco 虚拟环境的 `Scripts` 目录加进 `PATH`——因为
    `ssr.integrations.miloco` 一律通过 `MilocoConfig.from_env()` 与 PATH 上的 `miloco-cli`

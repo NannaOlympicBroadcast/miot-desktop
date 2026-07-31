@@ -1345,6 +1345,13 @@ function renderAgentMilocoState(s) {
   }
   const loaded = (s.miloco_tools || []).length;
   const expected = (s.miloco_tools_expected || []).length;
+  if (s.miloco_tools_error) {
+    // The tools couldn't be constructed at all. Without this the only symptom
+    // is the model saying it can see the tool definitions but can't call them:
+    // the persona advertises them either way.
+    return `<div class="banner">Miloco 工具装载失败，助手只能看到工具说明却无法调用：
+      <code>${escapeHtml(String(s.miloco_tools_error).slice(0, 300))}</code></div>`;
+  }
   if (s.agent_built && loaded < expected) {
     return `<div class="banner">Miloco 工具未全部装载（${loaded}/${expected}）。
       重新发送一条消息会重建助手；若仍不完整，请查看后端日志。</div>`;
@@ -1354,6 +1361,9 @@ function renderAgentMilocoState(s) {
     s.miloco_server_token ? 'Token 已注入' : 'Token 未就绪',
     s.miloco_bridge ? '事件总线已连通' : '事件总线未连通',
   ];
+  // Worth showing: it means ssr's own agent_tools mechanism dropped them and we
+  // put them back — useful when comparing behaviour across runtime versions.
+  if (s.miloco_tools_source === 'fallback') bits.push('由本应用直接装载');
   return `<div class="hint">✓ ${escapeHtml(bits.join(' · '))}</div>`;
 }
 
