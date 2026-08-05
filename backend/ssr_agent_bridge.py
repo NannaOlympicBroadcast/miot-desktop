@@ -60,6 +60,9 @@ class SSRAgentBridge:
         self._lock = threading.Lock()
         self._miloco_bridge = None
         self._miloco_webhook_fallback = None
+        # How the Miloco tools were loaded, or why they weren't (see
+        # _attach_miloco_tools). None until an agent has been built.
+        self._miloco_tools_state: Optional[Dict[str, Any]] = None
         self._import_error: Optional[str] = None
 
     # ------------------------------------------------------------ availability
@@ -101,6 +104,13 @@ class SSRAgentBridge:
                 specs.append(MILOCO_TOOLS_SPEC)
             self._settings.agent_tools = specs
             self._agent = SSRAgent(self._settings)
+            # Registering the spec is not proof it loaded: ToolKit resolves
+            # agent_tools inside a bare `except Exception: continue`, so any
+            # failure (an older runtime that ignores agent_tools, an import
+            # error, a config error) drops the tools *silently* — while the
+            # persona keeps telling the model they exist. That combination is
+            # what produces "the tool definition is there but I can't call it".
+            self._attach_miloco_tools(self._agent)
             # Attach the Miloco activity → bus bridge so home events reach any
             # SSR bus-event handlers, and start the /miloco/webhook receiver
             # (ssr.integrations.miloco.start_bus_bridge) so Miloco's own
@@ -153,6 +163,57 @@ class SSRAgentBridge:
         except Exception as e:  # pylint: disable=broad-except
             return {"available": True, "error": str(e)}
 
+    def _attach_miloco_tools(self, agent) -> None:
+        """Guarantee the Miloco tools are callable, and explain it if they aren't.
+
+        Checks what the built agent actually ended up with. If the four tools
+        are missing, re-runs the same load ourselves so the exception ToolKit
+        swallowed becomes visible, and — when the load works in isolation —
+        attaches the tools to this toolkit instance directly, so a runtime that
+        ignores ``agent_tools`` still gets them.
+
+        `callables()` is the single method everything derives from (the provider
+        builds both its declarations and its dispatch table from it, and
+        `specs()` calls it), so patching that one place covers every consumer.
+        """
+        state: Dict[str, Any] = {"source": "spec", "error": None, "attached": []}
+        try:
+            toolkit = agent.toolkit
+            present = {getattr(fn, "__name__", "") for fn in toolkit.callables()}
+            missing = [n for n in MILOCO_TOOL_NAMES if n not in present]
+            if not missing:
+                state["attached"] = list(MILOCO_TOOL_NAMES)
+                self._miloco_tools_state = state
+                return
+
+            _LOGGER.warning("Miloco tools missing after build: %s", missing)
+            from ssr.integrations.miloco import MilocoTools
+            tools = list(MilocoTools(toolkit).callables())
+
+            original = toolkit.callables
+
+            def callables_with_miloco():
+                out = list(original())
+                have = {getattr(fn, "__name__", "") for fn in out}
+                return out + [t for t in tools if getattr(t, "__name__", "") not in have]
+
+            toolkit.callables = callables_with_miloco
+            # The 'tools' context category was seeded during __init__ from the
+            # pre-patch list; refresh it so the model's own view matches.
+            try:
+                agent.retriever.tool_specs = toolkit.specs() + agent.mcp_tool_specs
+            except Exception:  # pylint: disable=broad-except
+                pass
+            state["source"] = "fallback"
+            state["attached"] = [getattr(t, "__name__", "") for t in tools]
+            _LOGGER.info("attached Miloco tools directly: %s", state["attached"])
+        except Exception as e:  # pylint: disable=broad-except
+            # Now we know *why* — which is the whole point of doing this
+            # ourselves rather than leaving it to a silent except.
+            state["error"] = f"{type(e).__name__}: {e}"
+            _LOGGER.exception("could not attach Miloco tools")
+        self._miloco_tools_state = state
+
     def miloco_tooling(self) -> Dict[str, Any]:
         """Whether the agent can actually reach Miloco, and how.
 
@@ -169,11 +230,17 @@ class SSRAgentBridge:
             except Exception:  # pylint: disable=broad-except
                 loaded = []
         cli = os.environ.get("MILOCO_CLI_BIN") or shutil.which("miloco-cli")
+        state = self._miloco_tools_state or {}
         return {
             "agent_built": agent is not None,
             "tools": loaded,
             "miloco_tools": [n for n in MILOCO_TOOL_NAMES if n in loaded],
             "miloco_tools_expected": list(MILOCO_TOOL_NAMES),
+            # How the tools got in ("spec" = ssr's own agent_tools mechanism,
+            # "fallback" = we attached them because that mechanism dropped
+            # them), and the exception if they didn't get in at all.
+            "miloco_tools_source": state.get("source"),
+            "miloco_tools_error": state.get("error"),
             # miloco-cli is what the Miloco tools *and* the device-catalog /
             # home-profile context blocks shell out to; without it they all
             # degrade to nothing, which is what leaves the agent guessing.

@@ -143,7 +143,7 @@ npm start          # 启动应用
 
 ### 「安装 Miloco」这一步做了什么
 
-后端 `miloco_controller.py` 逐步执行以下 8 步（界面上实时显示每步状态/耗时，可展开原始日志，
+后端 `miloco_controller.py` 逐步执行以下 9 步（界面上实时显示每步状态/耗时，可展开原始日志，
 完整日志同时写到 `$MILOCO_ROOT/install.log`）：
 
 1. 检测本机环境（Python / Git / Node·pnpm / 摄像头 DLL）
@@ -156,26 +156,31 @@ npm start          # 启动应用
    而 Miloco 从 `$MILOCO_HOME/models` 读取——这一步是 Docker 版本没有做、感知功能因此
    不可用的地方）
 6. 创建虚拟环境 `$MILOCO_ROOT/venv`
-7. 依次 `pip install backend/miot`、`backend/miloco`、`cli`（前两者顺序同镜像构建：先装
+7. 写入 **Windows 兼容层**（见下）。它是流程里的独立一步，且刻意排在装包**之前**——补的是
+   标准库缺口，从这一步起，安装期间任何一次 import（构建后端、包自身的安装期代码、我们自己的
+   探针）都已被覆盖
+8. 依次 `pip install backend/miot`、`backend/miloco`、`cli`（前两者顺序同镜像构建：先装
    `miloco-miot` 源码，`miloco` 的同名依赖才不会去找不存在的 Windows wheel。第三个是
    `miloco-cli`——SSR 助手正是通过它拿设备目录、家庭档案并发通知，缺了它助手就是瞎的）
-8. 写入 **Windows 兼容层**（见下）并校验：在虚拟环境里实际执行一次
-   `import miloco.main`（Windows 上另加 `os.sysconf` / `zoneinfo` 检查）+ 记录
-   `$MILOCO_ROOT/install.json`
+9. 校验：重跑一次兼容层写入（此时已是空操作）→ 验证其确实生效，若 `.pth` 钩子无效则回退修补
+   `vmmap.py` 再验证 → 在虚拟环境里实际执行 `import miloco.main` 与 `import miloco_cli.main`
+   （Windows 上另加 `os.sysconf` / `zoneinfo` 检查）→ 记录 `$MILOCO_ROOT/install.json` 并把本次
+   安装导出给 SSR 助手
 
 网络受限时可在「镜像源设置」里选 PyPI / NPM 镜像（选择保存在本机，下次沿用）。首次安装需要
 下载数百 MB（源码含 79 MB 感知模型 + 依赖 wheel），通常几分钟。
 
-> 第 8 步为什么要真的 import 一遍：Miloco 至今遇到的每个 Windows 不兼容点都发生在
+> 第 9 步为什么要真的 import 一遍：Miloco 至今遇到的每个 Windows 不兼容点都发生在
 > **导入期**（见下），而不是运行期。把 `import miloco.main` 放进安装校验，等于把
 > 「安装成功、一启动就崩」变成「安装失败并附上 traceback」。
 
 ### Windows 兼容层
 
 上游只支持 Linux/macOS（安装脚本直接拒绝 Windows），因此有几处 POSIX-only 的标准库调用是
-无条件执行的，且都在 `import` 期就触发——后端来不及打任何日志就退出。安装器会往虚拟环境的
-site-packages 写入两样东西（**不改上游源码**，因为改了会被下一次更新覆盖），并在**每次安装和
-每次启动时**重写，所以旧版本装出来的环境无需重装即可获得新补丁：
+无条件执行的，且都在 `import` 期就触发——后端来不及打任何日志就退出。补丁**内置在安装流程里**
+（第 7 步写入、第 9 步校验），此外**每次启动前**也会重写一遍，并且可以随时点界面上的
+「修复兼容层」按钮手动重来一次——所以旧版本装出来的环境无需重装即可获得新补丁。写入虚拟环境的
+site-packages，**不改上游源码**（改了会被下一次更新覆盖）：
 
 | 文件 | 补什么 | 为什么必须 |
 | --- | --- | --- |
@@ -289,6 +294,12 @@ Agent（后端 `ssr_agent_bridge.py`）。相比早期基于完整 `ssr-agent`�
    `miloco_habit_suggest` 四个工具（上一条的 `apply_smart_home_scope` 只提供提示词素材——它告诉
    模型这些工具存在，却不提供工具本身；只做前者的话，小模型会“知道有 `miloco_im_push`”，然后用
    `run_command echo` 假装查询并编造结果）。
+   装载后还会**验证**：`ToolKit` 解析 `agent_tools` 的代码包在 `except Exception: continue` 里，
+   任何失败（运行时版本较旧不认 `agent_tools`、导入出错、配置出错）都会被**静默**丢弃——而人设
+   照旧告诉模型这些工具存在，于是就出现「发现了工具定义，但是无法调用」。因此后端在建好助手后会
+   检查这四个工具是否真的在 `toolkit.callables()` 里；不在就自己再装一次以拿到被吞掉的异常，
+   并在可行时直接挂到该 toolkit 实例上（`callables()` 是声明、分发、上下文三者共同的来源，
+   补这一处即可全覆盖）。装载方式与失败原因都会出现在「SSR 助手」标签页顶部。
    同时后端会把 `MILOCO_HOME` / `MILOCO_SERVER_URL` / `MILOCO_SERVER_TOKEN` / `MILOCO_CLI_BIN`
    导出到自身进程，并把 Miloco 虚拟环境的 `Scripts` 目录加进 `PATH`——因为
    `ssr.integrations.miloco` 一律通过 `MilocoConfig.from_env()` 与 PATH 上的 `miloco-cli`

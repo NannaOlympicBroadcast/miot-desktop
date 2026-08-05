@@ -663,6 +663,14 @@ async def h_miloco_start(request: web.Request) -> web.Response:
         return _err(str(err))
 
 
+async def h_miloco_repair(request: web.Request) -> web.Response:
+    """Re-apply the Windows compatibility layer to an existing install."""
+    try:
+        return _json(await MILOCO.repair())
+    except Exception as err:  # pylint: disable=broad-except
+        return _err(str(err))
+
+
 async def h_miloco_stop(request: web.Request) -> web.Response:
     try:
         return _json(await MILOCO.stop())
@@ -834,6 +842,7 @@ def build_app() -> web.Application:
     app.router.add_get("/api/miloco/install/status", h_miloco_install_status)
     app.router.add_post("/api/miloco/start", h_miloco_start)
     app.router.add_post("/api/miloco/stop", h_miloco_stop)
+    app.router.add_post("/api/miloco/repair", h_miloco_repair)
     app.router.add_get("/api/miloco/logs", h_miloco_logs)
     app.router.add_get("/api/agent/status", h_agent_status)
     app.router.add_get("/api/agent/models", h_agent_models_get)

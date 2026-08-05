@@ -978,7 +978,7 @@ class MilocoController:
             pass
 
         # -- 1/8 toolchain ---------------------------------------------------
-        self._step_start("1", "[1/8] 检测本机环境")
+        self._step_start("1", "[1/9] 检测本机环境")
         env_info = self.probe_env(force=True)
         for k, v in env_info.items():
             if k == "pnpm_argv":
@@ -1005,7 +1005,7 @@ class MilocoController:
         git = env_info["git"]
 
         # -- 2/8 source ------------------------------------------------------
-        self._step_start("2", f"[2/8] 获取 Miloco 源码 ({self._ref})")
+        self._step_start("2", f"[2/9] 获取 Miloco 源码 ({self._ref})")
         # `git fetch <arbitrary ref> --depth 1` (rather than `clone --branch`)
         # accepts branch names, tags *and* full commit SHAs. Depth 1 means no
         # tag history reaches hatch-vcs, so the build falls back to the
@@ -1033,7 +1033,7 @@ class MilocoController:
         self._step_done("2", f"commit {commit}" if commit else None)
 
         # -- 3/8 web dashboard ----------------------------------------------
-        self._step_start("3", "[3/8] 构建 Web 控制台")
+        self._step_start("3", "[3/9] 构建 Web 控制台")
         if not build_web:
             self._step_skip("3", "缺少 Node.js / pnpm，控制台将不可用（HTTP API 仍可用）")
         else:
@@ -1061,7 +1061,7 @@ class MilocoController:
             self._step_done("3")
 
         # -- 4/8 camera DLL --------------------------------------------------
-        self._step_start("4", "[4/8] 注入 Windows 摄像头原生库")
+        self._step_start("4", "[4/9] 注入 Windows 摄像头原生库")
         dll = env_info["camera_dll"]
         if not IS_WINDOWS:
             # Upstream ships the linux/darwin builds itself; injecting our DLL
@@ -1086,7 +1086,7 @@ class MilocoController:
             self._step_done("4")
 
         # -- 5/8 perception models ------------------------------------------
-        self._step_start("5", "[5/8] 部署感知模型")
+        self._step_start("5", "[5/9] 部署感知模型")
         try:
             copied, total = self._copy_models()
         except OSError as e:
@@ -1100,7 +1100,7 @@ class MilocoController:
                 self._step_done("5", f"{copied}/{total} 个模型 -> {MILOCO_HOME / 'models'}")
 
         # -- 6/8 venv --------------------------------------------------------
-        self._step_start("6", "[6/8] 创建 Python 虚拟环境")
+        self._step_start("6", "[6/9] 创建 Python 虚拟环境")
         py = env_info["python"]
         if not _venv_python().exists():
             # `--clear` only when a broken venv is already there: recreating a
@@ -1114,8 +1114,27 @@ class MilocoController:
         else:
             self._step_done("6", f"复用已有虚拟环境 {VENV_DIR}")
 
-        # -- 7/8 pip install -------------------------------------------------
-        self._step_start("7", "[7/8] 安装 Miloco 及其依赖（首次较慢）")
+        # -- 7/9 Windows compat layer ----------------------------------------
+        # Its own step, and placed *before* the packages go in: the shims are
+        # stdlib gaps, so anything that imports during installation (a build
+        # backend, a package's own post-install code, our own probes) is covered
+        # from here on. Verification happens in step 9, once there is something
+        # to import.
+        self._step_start("7", "[7/9] 写入 Windows 兼容层")
+        if not IS_WINDOWS:
+            self._step_skip("7", "非 Windows 平台，无需兼容层")
+        else:
+            try:
+                written = self._write_win_compat()
+            except (OSError, RuntimeError) as e:
+                self._fail("7", f"写入 Windows 兼容层失败：{e}")
+                return
+            for path in written:
+                self._append(f"  {path}")
+            self._step_done("7", f"{len(written)} 个文件" if written else "已是最新")
+
+        # -- 8/9 pip install -------------------------------------------------
+        self._step_start("8", "[8/9] 安装 Miloco 及其依赖（首次较慢）")
         pip_env = {
             **os.environ,
             "PIP_INDEX_URL": _resolve_mirror(pip_mirror, PIP_MIRRORS),
@@ -1151,31 +1170,27 @@ class MilocoController:
             code = await self._stream([vpy, "-m", "pip", "install", str(SRC_DIR / "cli")],
                                       env=pip_env)
         if code != 0:
-            self._fail("7", f"安装依赖失败（exit {code}）。网络受限时可在「镜像源设置」里选择 PyPI 镜像后重试。", code)
+            self._fail("8", f"安装依赖失败（exit {code}）。网络受限时可在「镜像源设置」里选择 PyPI 镜像后重试。", code)
             return
-        self._step_done("7")
+        self._step_done("8")
 
-        # -- 8/8 Windows compat layer + smoke check --------------------------
-        self._step_start("8", "[8/8] 写入 Windows 兼容层并校验安装")
+        # -- 9/9 verify -------------------------------------------------------
+        self._step_start("9", "[9/9] 校验安装")
         if IS_WINDOWS:
-            try:
-                for path in self._write_win_compat():
-                    self._append(f"  兼容层 -> {path}")
-            except (OSError, RuntimeError) as e:
-                self._fail("8", f"写入 Windows 兼容层失败：{e}")
-                return
-            # Same write -> verify -> patch-as-fallback path start() uses, so a
-            # fresh install can't hand over an inert layer either.
+            # Re-runs the write (a no-op now), then proves the layer is live and
+            # falls back to patching vmmap.py if the .pth hook turns out inert —
+            # the same path start() takes, so a fresh install can't hand over a
+            # layer that only *looks* applied.
             await asyncio.get_event_loop().run_in_executor(None, self._ensure_win_compat)
             state = self._win_compat or {}
             self._append(f"  兼容层校验：verified={state.get('verified')} "
                          f"method={state.get('method')} {state.get('detail', '')}")
             if state.get("verified") is False:
-                self._fail("8", "Windows 兼容层未生效（虚拟环境不会加载 .pth 启动钩子，"
+                self._fail("9", "Windows 兼容层未生效（虚拟环境不会加载 .pth 启动钩子，"
                                 f"且无法回退修补源码）：{state.get('detail', '')}")
                 return
         if not _backend_exe().exists():
-            self._fail("8", f"安装完成但未生成 {_backend_exe()}，请查看上面的安装日志。")
+            self._fail("9", f"安装完成但未生成 {_backend_exe()}，请查看上面的安装日志。")
             return
         # `import miloco.main` is the check that matters: it walks the whole
         # import chain the backend walks at startup, which is where every
@@ -1193,7 +1208,12 @@ class MilocoController:
             ]
         probe += [
             "import miloco.main",
-            "print('miloco', m.version('miloco'), '| miloco-miot', m.version('miloco-miot'))",
+            # miloco_cli has its own module-scope `import fcntl` (habit_store),
+            # and the SSR agent reaches Miloco through it — so it belongs in the
+            # same check rather than failing later, mid-conversation.
+            "import miloco_cli.main",
+            "print('miloco', m.version('miloco'), '| miloco-miot', m.version('miloco-miot'),"
+            " '| miloco-cli', m.version('miloco-cli'))",
         ]
         probe_env = {**pip_env, "MILOCO_HOME": str(MILOCO_HOME),
                      "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"}
@@ -1202,10 +1222,13 @@ class MilocoController:
         for line in out.splitlines():
             self._append("  " + line)
         if check.returncode != 0:
-            self._fail("8", "安装校验失败：虚拟环境中无法导入 miloco（详见日志中的 traceback）。",
-                       check.returncode)
+            self._fail("9", "安装校验失败：虚拟环境中无法导入 miloco / miloco-cli"
+                            "（详见日志中的 traceback）。", check.returncode)
             return
-        self._step_done("8", out.splitlines()[-1] if out else None)
+        # Make this install reachable by the SSR agent right away, rather than
+        # only after the next start.
+        self.export_integration_env()
+        self._step_done("9", out.splitlines()[-1] if out else None)
 
         web_static = SRC_DIR / "backend" / "miloco" / "src" / "miloco" / "static" / "index.html"
         info = {
@@ -1393,12 +1416,21 @@ class MilocoController:
         """
         if not IS_WINDOWS or not self.installed():
             return
-        state: Dict[str, Any] = {"method": "pth", "verified": None, "detail": ""}
+        state: Dict[str, Any] = {
+            "method": "pth", "verified": None, "detail": "",
+            "written": [], "write_error": None,
+        }
         try:
-            for path in self._write_win_compat():
+            written = self._write_win_compat()
+            state["written"] = [p.name for p in written]
+            for path in written:
                 _LOGGER.info("refreshed Windows compat file %s", path)
         except (OSError, RuntimeError) as e:
-            state["detail"] = f"写入失败：{e}"
+            # Reported separately from `verified`: an install whose layer is
+            # already in place still verifies fine while a refresh fails, and
+            # silently swallowing that would hide a venv we can no longer
+            # maintain (permissions, antivirus, a moved venv).
+            state["write_error"] = str(e)
             _LOGGER.warning("could not refresh Windows compat files: %s", e)
         ok, out = self._verify_win_compat()
         if ok is False:
@@ -1409,7 +1441,7 @@ class MilocoController:
             if patched:
                 _LOGGER.info("patched %s", patched)
         state["verified"] = ok
-        state["detail"] = state["detail"] or out
+        state["detail"] = out
         self._win_compat = state
 
     # ------------------------------------------------- SSR agent integration
@@ -1455,6 +1487,25 @@ class MilocoController:
             if scripts not in parts:
                 os.environ["PATH"] = os.pathsep.join([scripts, *parts])
         return env
+
+    async def repair(self) -> Dict[str, Any]:
+        """Re-apply the Windows compat layer to an existing install, on demand.
+
+        The same thing install step 7+9 and every start() do — exposed as an
+        action so a user whose Miloco was installed by an older build of this
+        app can fix it from the UI, with no repo checkout and no PowerShell
+        (scripts/apply_win_compat.py exists for when the app itself is too old
+        to have this button).
+        """
+        if not self.installed():
+            raise RuntimeError(f"尚未安装 Miloco（缺少 {_backend_exe()}），无需修复。")
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, self._ensure_win_compat)
+        self.export_integration_env()
+        state = dict(self._win_compat or {})
+        if not IS_WINDOWS:
+            state = {"method": "none", "verified": None, "detail": "非 Windows 平台，无需兼容层"}
+        return {"win_compat": state, "integration": self.integration_env_status()}
 
     def integration_env_status(self) -> Dict[str, Any]:
         """What the SSR agent will see when it looks for Miloco."""
